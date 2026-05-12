@@ -1,6 +1,5 @@
-<<<<<<< HEAD
 # E2ee
-=======
+
 # vault.msg — Zero-Knowledge E2EE Messenger
 
 A **production-ready**, end-to-end encrypted messaging app.
