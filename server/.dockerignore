@@ -1,0 +1,9 @@
+node_modules
+*.bak
+vault.db
+vault.db-wal
+vault.db-shm
+.env
+.env.*
+!.env.example
+*.log

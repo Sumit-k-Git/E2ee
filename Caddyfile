@@ -1,0 +1,53 @@
+# Caddyfile — automatic HTTPS via Let's Encrypt
+# Replace yourdomain.com with your actual domain
+
+yourdomain.com {
+    # Serve the React frontend
+    reverse_proxy client:80
+
+    # Security headers (Caddy adds them for ALL responses)
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+        X-Frame-Options "DENY"
+        X-Content-Type-Options "nosniff"
+        Referrer-Policy "no-referrer"
+        Permissions-Policy "camera=(), microphone=(), geolocation=()"
+        -Server
+    }
+
+    # Logging
+    log {
+        output file /data/access.log {
+            roll_size 10mb
+            roll_keep 5
+        }
+    }
+}
+
+api.yourdomain.com {
+    # Proxy all /api/* and WebSocket /ws to the backend
+    reverse_proxy server:4000
+
+    # WebSocket support
+    @websocket {
+        header Connection *Upgrade*
+        header Upgrade websocket
+    }
+    handle @websocket {
+        reverse_proxy server:4000
+    }
+
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+        X-Frame-Options "DENY"
+        X-Content-Type-Options "nosniff"
+        -Server
+    }
+
+    log {
+        output file /data/api-access.log {
+            roll_size 10mb
+            roll_keep 5
+        }
+    }
+}

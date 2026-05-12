@@ -1,0 +1,39 @@
+# Dependencies
+node_modules/
+**/node_modules/
+
+# Environment files — NEVER commit secrets
+.env
+server/.env
+client/.env
+*.env.local
+
+# Build output
+client/dist/
+client/dist-ssr/
+
+# Database
+*.db
+*.db-wal
+*.db-shm
+backups/
+
+# Logs
+*.log
+logs/
+
+# Backup files
+*.bak
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Docker
+caddy_data/
+caddy_config/
