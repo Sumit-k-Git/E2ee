@@ -32,6 +32,7 @@ function getDb() {
       password_hash   TEXT NOT NULL,
       public_key      TEXT NOT NULL,
       key_fingerprint TEXT NOT NULL,
+      email           TEXT,
       created_at      INTEGER NOT NULL DEFAULT (unixepoch()),
       last_seen       INTEGER
     );
@@ -93,10 +94,10 @@ function getDb() {
 }
 
 const userQueries = {
-  create(id, username, passwordHash, publicKey, keyFingerprint) {
+  create(id, username, passwordHash, publicKey, keyFingerprint, email) {
     return getDb()
-      .prepare('INSERT INTO users (id, username, password_hash, public_key, key_fingerprint) VALUES (?, ?, ?, ?, ?)')
-      .run(id, username, passwordHash, publicKey, keyFingerprint);
+      .prepare('INSERT INTO users (id, username, password_hash, public_key, key_fingerprint, email) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(id, username, passwordHash, publicKey, keyFingerprint, email || null);
   },
   findByUsername(username) {
     return getDb().prepare('SELECT * FROM users WHERE username = ?').get(username);

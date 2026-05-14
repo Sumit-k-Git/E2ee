@@ -28,13 +28,7 @@ const routes = require('./routes');
 const { createWsServer } = require('./websocket');
 
 const PORT = parseInt(process.env.PORT) || 4000;
-// Allow multiple origins for dev/prod; provide comma-separated list in ALLOWED_ORIGIN.
-// Example: ALLOWED_ORIGIN=http://localhost:5173,http://127.0.0.1:5173
-const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGIN || 'http://localhost:5173')
-  .split(',')
-  .map(s => s.trim())
-  .filter(Boolean);
-
+const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || 'http://localhost:5173';
 
 // ── Initialize DB ─────────────────────────────────────────────────────────
 getDb(); // runs schema migrations on first start
@@ -48,19 +42,18 @@ app.set('trust proxy', 1);
 
 // ── Security headers (Helmet) ─────────────────────────────────────────────
 app.use(helmet({
-  // Content-Security-Policy
-  // In local dev, allow both websocket and HTTP API calls to localhost:4000.
+  // Content-Security-Policy: only allow resources from same origin
   contentSecurityPolicy: {
     directives: {
-      defaultSrc: ["'self'"],
-      scriptSrc: ["'self'", "'unsafe-inline'"],
-      styleSrc: ["'self'", "'unsafe-inline'"],
-      imgSrc: ["'self'", 'data:', 'blob:'],
-      connectSrc: ["'self'", 'ws:', 'wss:', 'http://localhost:4000', 'http://127.0.0.1:4000'],
-      workerSrc: ["'self'", 'blob:'],
-      objectSrc: ["'none'"],
-      frameAncestors: ["'none'"],
-    },
+  defaultSrc: ["'self'"],
+  scriptSrc: ["'self'", "'unsafe-inline'"],
+  styleSrc: ["'self'", "'unsafe-inline'"],
+  imgSrc: ["'self'", 'data:', 'blob:'],
+  connectSrc: ["'self'", 'ws:', 'wss:'],
+  workerSrc: ["'self'", 'blob:'],
+  objectSrc: ["'none'"],
+  frameAncestors: ["'none'"],
+},
   },
   // Prevent browsers from caching responses containing tokens
   referrerPolicy: {
@@ -77,19 +70,7 @@ app.use((req, res, next) => {
 });
 // ── CORS ──────────────────────────────────────────────────────────────────
 app.use(cors({
-  origin: function (origin, cb) {
-    // Allow requests with no origin (e.g. curl, same-origin, health checks)
-    if (!origin) return cb(null, true);
-    if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
-
-    // Also allow common dev ports if origin is present in ALLOWED_ORIGINS with/without trailing slash
-
-    const normalized = origin?.replace(/\/$/, '');
-    if (ALLOWED_ORIGINS.some(o => o.replace(/\/$/, '') === normalized)) return cb(null, true);
-
-    return cb(new Error('CORS origin not allowed'), false);
-  },
-
+  origin: ALLOWED_ORIGIN,
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
@@ -137,10 +118,9 @@ createWsServer(server);
 
 server.listen(PORT, () => {
   console.log(`[server] vault.msg listening on port ${PORT}`);
-  console.log(`[server] Allowed origins: ${ALLOWED_ORIGINS.join(', ')}`);
+  console.log(`[server] Allowed origin: ${ALLOWED_ORIGIN}`);
   console.log(`[server] NODE_ENV: ${process.env.NODE_ENV}`);
 });
-
 
 // ── Periodic maintenance ──────────────────────────────────────────────────
 // Purge expired refresh tokens every hour

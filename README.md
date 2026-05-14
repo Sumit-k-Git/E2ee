@@ -1,5 +1,3 @@
-# E2ee
-
 # vault.msg — Zero-Knowledge E2EE Messenger
 
 A **production-ready**, end-to-end encrypted messaging app.
@@ -361,4 +359,3 @@ This is the same model used by Signal ("Safety Numbers") and WhatsApp ("Security
 ## License
 
 MIT — see LICENSE file.
->>>>>>> ae4725e (Initial commit)

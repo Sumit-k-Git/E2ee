@@ -5,8 +5,8 @@
  * Server never sees plaintext. All message fields are ciphertext only.
  */
 
-const express = require('express');
-const bcrypt  = require('bcrypt');
+const express   = require('express');
+const bcrypt    = require('bcrypt');
 const { v4: uuidv4 } = require('uuid');
 const rateLimit = require('express-rate-limit');
 const {
@@ -14,6 +14,7 @@ const {
   revokeAllTokens, requireAuth, getClientIp,
 } = require('./auth');
 const { users, messages, prekeys, audit } = require('./database');
+const { sendOTP, verifyOTP, validateOTPToken } = require('./otp');
 
 const router = express.Router();
 const BCRYPT_ROUNDS = 12;
@@ -23,6 +24,12 @@ const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: parseInt(process.env.AUTH_RATE_LIMIT_MAX) || 10,
   message: { error: 'Too many auth attempts, try again later' },
+  standardHeaders: true, legacyHeaders: false,
+});
+const otpLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  message: { error: 'Too many OTP requests, please wait 15 minutes' },
   standardHeaders: true, legacyHeaders: false,
 });
 const searchLimiter = rateLimit({
@@ -35,35 +42,89 @@ function validateUsername(u) {
   return typeof u === 'string' && /^[a-zA-Z0-9_]{3,32}$/.test(u);
 }
 function validatePassword(p) {
-  return (
-    typeof p === 'string' && p.length >= 12 &&
-    /[A-Z]/.test(p) && /[a-z]/.test(p) &&
-    /[0-9]/.test(p) && /[^A-Za-z0-9]/.test(p)
-  );
+  return typeof p === 'string' && p.length >= 8;
+}
+function validateEmail(e) {
+  return typeof e === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e) && e.length <= 254;
 }
 function validateBase64(s, maxLen = 200) {
   return typeof s === 'string' && s.length <= maxLen && /^[A-Za-z0-9+/=]+$/.test(s);
 }
 
+// ── OTP routes ────────────────────────────────────────────────────────────
+
+/**
+ * POST /api/auth/send-otp
+ * Body: { email }
+ * Sends a 6-digit OTP to the email address.
+ */
+router.post('/auth/send-otp', otpLimiter, async (req, res) => {
+  const { email } = req.body;
+  if (!validateEmail(email)) {
+    return res.status(400).json({ error: 'Invalid email address' });
+  }
+  try {
+    const result = await sendOTP(email);
+    // In dev mode return preview URL so developer can see the email
+    return res.json({
+      sent: true,
+      ...(result.previewUrl ? { dev_preview_url: result.previewUrl } : {}),
+    });
+  } catch (e) {
+    return res.status(429).json({ error: e.message });
+  }
+});
+
+/**
+ * POST /api/auth/verify-otp
+ * Body: { email, code }
+ * Returns { verified: true, otp_token } — pass otp_token to /register
+ */
+router.post('/auth/verify-otp', otpLimiter, (req, res) => {
+  const { email, code } = req.body;
+  if (!validateEmail(email)) return res.status(400).json({ error: 'Invalid email' });
+  if (!code || String(code).trim().length !== 6) return res.status(400).json({ error: 'Code must be 6 digits' });
+  try {
+    const result = verifyOTP(email, code);
+    return res.json(result);
+  } catch (e) {
+    return res.status(400).json({ error: e.message });
+  }
+});
+
 // ── Auth ──────────────────────────────────────────────────────────────────
+
+/**
+ * POST /api/auth/register
+ * Body: { username, password, public_key, key_fingerprint, email, otp_token }
+ * otp_token is issued by /verify-otp — proves email was verified.
+ */
 router.post('/auth/register', authLimiter, async (req, res) => {
-  const { username, password, public_key, key_fingerprint } = req.body;
+  const { username, password, public_key, key_fingerprint, email, otp_token } = req.body;
   const ip = getClientIp(req);
 
   if (!validateUsername(username))
-    return res.status(400).json({ error: 'Username: 3-32 chars, letters/numbers/underscores only' });
+    return res.status(400).json({ error: 'Username: 3–32 characters, letters/numbers/underscores only' });
   if (!validatePassword(password))
-    return res.status(400).json({ error: 'Password: 12+ chars with uppercase, lowercase, number, symbol' });
+    return res.status(400).json({ error: 'Password must be at least 8 characters' });
+  if (!validateEmail(email))
+    return res.status(400).json({ error: 'Invalid email address' });
   if (!validateBase64(public_key, 64))
     return res.status(400).json({ error: 'Invalid public key format' });
   if (typeof key_fingerprint !== 'string' || key_fingerprint.length !== 64)
     return res.status(400).json({ error: 'Invalid key fingerprint' });
+
+  // Validate OTP token — confirms email was verified before this request
+  if (!otp_token || !validateOTPToken(otp_token, email)) {
+    return res.status(403).json({ error: 'Email verification required. Please verify your email with an OTP first.' });
+  }
+
   if (users.findByUsername(username))
     return res.status(409).json({ error: 'Username already taken' });
 
   const id = uuidv4();
   const passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
-  users.create(id, username, passwordHash, public_key, key_fingerprint);
+  users.create(id, username, passwordHash, public_key, key_fingerprint, email);
   audit.log('register', id, ip, req.headers['user-agent']);
 
   const { token: accessToken } = signAccessToken(id, username);
@@ -76,6 +137,10 @@ router.post('/auth/register', authLimiter, async (req, res) => {
   });
 });
 
+/**
+ * POST /api/auth/login
+ * Body: { username, password }
+ */
 router.post('/auth/login', authLimiter, async (req, res) => {
   const { username, password } = req.body;
   const ip = getClientIp(req);
@@ -100,7 +165,10 @@ router.post('/auth/login', authLimiter, async (req, res) => {
   const { raw: refreshToken }  = signRefreshToken(user.id);
 
   return res.json({
-    user: { id: user.id, username: user.username, public_key: user.public_key, key_fingerprint: user.key_fingerprint },
+    user: {
+      id: user.id, username: user.username,
+      public_key: user.public_key, key_fingerprint: user.key_fingerprint,
+    },
     access_token: accessToken,
     refresh_token: refreshToken,
   });
@@ -109,13 +177,10 @@ router.post('/auth/login', authLimiter, async (req, res) => {
 router.post('/auth/refresh', async (req, res) => {
   const { refresh_token } = req.body;
   if (!refresh_token) return res.status(400).json({ error: 'Refresh token required' });
-
   const result = rotateRefreshToken(refresh_token);
   if (!result) return res.status(401).json({ error: 'Invalid or expired refresh token' });
-
   const user = users.findById(result.userId);
   if (!user) return res.status(401).json({ error: 'User not found' });
-
   const { token: accessToken } = signAccessToken(user.id, user.username);
   return res.json({ access_token: accessToken, refresh_token: result.newRefreshToken });
 });
@@ -159,51 +224,35 @@ router.put('/users/key', requireAuth, (req, res) => {
 router.get('/messages/:contactId', requireAuth, (req, res) => {
   const limit    = Math.min(parseInt(req.query.limit) || 50, 100);
   const beforeTs = req.query.before_ts ? parseInt(req.query.before_ts) : null;
-
-  const contact = users.findById(req.params.contactId);
+  const contact  = users.findById(req.params.contactId);
   if (!contact) return res.status(404).json({ error: 'Contact not found' });
-
   const history = messages.getConversation(req.user.id, req.params.contactId, limit, beforeTs);
   return res.json({ messages: history, contact });
 });
 
-/**
- * POST /api/messages
- * REST fallback for sending messages (added by Sumit).
- * Accepts ciphertext + nonce — no plaintext ever reaches this endpoint.
- * Note: no ephemeral_pub means no forward secrecy for REST-sent messages.
- * Use WebSocket for full forward secrecy.
- */
 router.post('/messages', requireAuth, (req, res) => {
   const { recipient_id, ciphertext, nonce, ephemeral_pub } = req.body;
-
   if (!recipient_id || typeof recipient_id !== 'string')
     return res.status(400).json({ error: 'recipient_id required' });
   if (!validateBase64(ciphertext, 16384))
     return res.status(400).json({ error: 'Invalid ciphertext' });
   if (!validateBase64(nonce, 64))
     return res.status(400).json({ error: 'Invalid nonce' });
-
   const recipient = users.findById(recipient_id);
   if (!recipient) return res.status(404).json({ error: 'Recipient not found' });
   if (recipient_id === req.user.id) return res.status(400).json({ error: 'Cannot message yourself' });
-
   const messageId = uuidv4();
   const now = Date.now();
-
-  // Use insert() with ephemeral_pub if provided, otherwise create() without it
   if (ephemeral_pub && validateBase64(ephemeral_pub, 64)) {
     messages.insert(messageId, req.user.id, recipient_id, ciphertext, nonce, ephemeral_pub, now);
   } else {
     messages.create({ id: messageId, sender_id: req.user.id, recipient_id, ciphertext, nonce, created_at: now });
   }
-
   return res.status(201).json({ id: messageId, ok: true, server_ts: now });
 });
 
 router.get('/conversations', requireAuth, (req, res) => {
-  const convos = messages.getConversationList(req.user.id);
-  return res.json(convos);
+  return res.json(messages.getConversationList(req.user.id));
 });
 
 router.delete('/messages/:messageId', requireAuth, (req, res) => {
@@ -218,7 +267,6 @@ router.post('/prekeys', requireAuth, (req, res) => {
   const batch = req.body.prekeys;
   if (!Array.isArray(batch) || batch.length === 0 || batch.length > 100)
     return res.status(400).json({ error: 'Invalid prekeys batch (1-100 items)' });
-
   for (const pk of batch) {
     if (!validateBase64(pk.prekey_pub, 64) || !validateBase64(pk.signature, 128))
       return res.status(400).json({ error: 'Invalid prekey format' });
@@ -232,22 +280,19 @@ router.get('/prekeys/:userId', requireAuth, (req, res) => {
   if (!prekey) return res.status(404).json({ error: 'No prekeys available for this user' });
   const user = users.findById(req.params.userId);
   return res.json({
-    user_id: req.params.userId,
-    identity_key: user?.public_key,
+    user_id: req.params.userId, identity_key: user?.public_key,
     key_fingerprint: user?.key_fingerprint,
-    prekey_pub: prekey.prekey_pub,
-    signature: prekey.signature,
+    prekey_pub: prekey.prekey_pub, signature: prekey.signature,
   });
 });
 
 router.get('/prekeys/:userId/count', requireAuth, (req, res) => {
-  const { count } = prekeys.countAvailable(req.params.userId);
-  return res.json({ count });
+  return res.json(prekeys.countAvailable(req.params.userId));
 });
 
 // ── Health ────────────────────────────────────────────────────────────────
 router.get('/health', (req, res) => {
-  res.json({ status: 'ok', ts: Date.now(), version: process.env.npm_package_version || '1.0.0' });
+  res.json({ status: 'ok', ts: Date.now(), version: '1.0.0' });
 });
 
 module.exports = router;
