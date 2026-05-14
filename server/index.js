@@ -49,7 +49,7 @@ app.use(helmet({
   scriptSrc: ["'self'", "'unsafe-inline'"],
   styleSrc: ["'self'", "'unsafe-inline'"],
   imgSrc: ["'self'", 'data:', 'blob:'],
-  connectSrc: ["'self'", 'ws:', 'wss:'],
+  connectSrc: ["'self'", "http://localhost:4000", "ws://localhost:4000", "wss:"],
   workerSrc: ["'self'", 'blob:'],
   objectSrc: ["'none'"],
   frameAncestors: ["'none'"],
@@ -76,6 +76,11 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization'],
   exposedHeaders: ['X-RateLimit-Remaining'],
 }));
+app.use(cors({
+  origin: 'http://localhost:5173',
+  credentials: true
+}));
+
 
 // ── Body parsing with size limit ──────────────────────────────────────────
 // 64KB max — encrypted messages + metadata; no file uploads expected
