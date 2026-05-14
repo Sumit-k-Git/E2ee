@@ -2,6 +2,9 @@
 FROM node:22-alpine AS deps
 WORKDIR /app
 
+# Install build tools for native addons (better-sqlite3, bcrypt)
+RUN apk add --no-cache python3 make g++
+
 # Copy manifests first (better layer caching)
 COPY package.json package-lock.json* ./
 RUN npm ci --omit=dev && npm cache clean --force
