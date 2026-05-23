@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # vault.msg — start-local.sh
-# Single command to run everything locally. No Docker needed.
+# Runs vault.msg locally. No Docker needed.
 # Works on: macOS, Linux, Windows (Git Bash or WSL)
-#
-# Usage:  ./start-local.sh
 
 set -euo pipefail
+
+# Always resolve to the directory this script lives in
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
@@ -16,90 +16,83 @@ err()  { echo -e "\n${R}${B}ERROR:${NC} $1\n"; exit 1; }
 info() { echo -e "  ${BL}→${NC} $1"; }
 
 echo -e "\n${BL}${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${BL}${B}   vault.msg — Starting locally${NC}"
+echo -e "${BL}${B}   vault.msg — Local Startup${NC}"
 echo -e "${BL}${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}\n"
 
-# ── 1. Check Node.js ────────────────────────────────────────────
+# ── 1. Check Node.js ─────────────────────────────────────────────
 if ! command -v node &>/dev/null; then
   echo -e "${Y}Node.js is not installed.${NC}\n"
   echo "  Install it:"
   echo "  • Ubuntu/Debian: curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash - && sudo apt-get install -y nodejs"
   echo "  • macOS:         brew install node"
-  echo "  • Windows:       https://nodejs.org  (click LTS)"
-  err "Please install Node.js 18+ and re-run this script."
+  echo "  • Windows:       https://nodejs.org  (download LTS)"
+  err "Install Node.js 18+ then re-run this script."
 fi
 VER=$(node -e "process.stdout.write(String(process.versions.node.split('.')[0]))")
-[ "$VER" -lt 18 ] && err "Node.js 18+ required. You have $(node --version). Download from https://nodejs.org"
-ok "Node.js $(node --version) detected"
+[ "$VER" -lt 18 ] && err "Node.js 18+ required. You have $(node --version). Get it from https://nodejs.org"
+ok "Node.js $(node --version)"
 
-# ── 2. Install dependencies ─────────────────────────────────────
-if [ ! -d "server/node_modules" ]; then
-  info "Installing server packages (first time takes ~1 minute)..."
-  cd server && npm install && cd ..
-  ok "Server packages installed"
-else
-  ok "Server packages ready"
-fi
+# ── 2. Install server dependencies (always run — npm is smart about skipping) ──
+info "Installing server packages..."
+(cd "$SCRIPT_DIR/server" && npm install)
+ok "Server packages ready"
 
-if [ ! -d "client/node_modules" ]; then
-  info "Installing client packages..."
-  cd client && npm install && cd ..
-  ok "Client packages installed"
-else
-  ok "Client packages ready"
-fi
+# ── 3. Install client dependencies ───────────────────────────────
+info "Installing client packages..."
+(cd "$SCRIPT_DIR/client" && npm install)
+ok "Client packages ready"
 
-# ── 3. Setup .env with auto-generated secrets ───────────────────
-if [ ! -f "server/.env" ]; then
-  cp server/.env.example server/.env
-fi
-if [ ! -f "client/.env" ]; then
-  cp client/.env.example client/.env
-fi
+# ── 4. Setup .env files ───────────────────────────────────────────
+[ ! -f "$SCRIPT_DIR/server/.env" ] && cp "$SCRIPT_DIR/server/.env.example" "$SCRIPT_DIR/server/.env"
+[ ! -f "$SCRIPT_DIR/client/.env" ] && cp "$SCRIPT_DIR/client/.env.example" "$SCRIPT_DIR/client/.env"
 
-# Auto-generate any missing JWT secrets using Node.js crypto
+# Auto-generate missing JWT secrets
 node - << 'GENSCRIPT'
 const fs     = require('fs');
 const path   = require('path');
 const crypto = require('crypto');
-const gen    = () => crypto.randomBytes(64).toString('hex');
-const file   = path.join(__dirname, 'server', '.env');
-let env      = fs.readFileSync(file, 'utf8');
-let changed  = false;
+
+const file = path.join(process.cwd(), 'server', '.env');
+let env    = fs.readFileSync(file, 'utf8');
+let changed = false;
+
 for (const key of ['JWT_SECRET', 'JWT_REFRESH_SECRET', 'OTP_SECRET']) {
-  if (/^JWT_SECRET=\s*$|^JWT_REFRESH_SECRET=\s*$|^OTP_SECRET=\s*$/m.test(env) || env.match(new RegExp(`^${key}=\\s*$`, 'm'))) {
-    env = env.replace(new RegExp(`^${key}=.*$`, 'm'), `${key}=${gen()}`);
+  const pattern = new RegExp(`^${key}=\\s*$`, 'm');
+  if (pattern.test(env)) {
+    const secret = crypto.randomBytes(64).toString('hex');
+    env     = env.replace(pattern, `${key}=${secret}`);
     changed = true;
   }
 }
+
 if (changed) {
   fs.writeFileSync(file, env);
-  console.log('  \x1b[32m✓\x1b[0m JWT secrets generated');
+  console.log('  \x1b[32m✓\x1b[0m JWT secrets auto-generated');
 } else {
-  console.log('  \x1b[32m✓\x1b[0m Secrets already set');
+  console.log('  \x1b[32m✓\x1b[0m Secrets already configured');
 }
 GENSCRIPT
 
-# ── 4. Kill anything on our ports ──────────────────────────────
-kill_port() {
-  local PORT=$1
+# ── 5. Free ports if busy ─────────────────────────────────────────
+free_port() {
+  local p=$1
   if command -v lsof &>/dev/null; then
-    local PIDS=$(lsof -ti:$PORT 2>/dev/null || true)
-    if [ -n "$PIDS" ]; then
-      warn "Port $PORT busy — freeing it..."
-      echo "$PIDS" | xargs kill -9 2>/dev/null || true
+    local pids; pids=$(lsof -ti:"$p" 2>/dev/null || true)
+    if [ -n "$pids" ]; then
+      warn "Port $p in use — freeing it..."
+      echo "$pids" | xargs kill -9 2>/dev/null || true
       sleep 1
     fi
   elif command -v fuser &>/dev/null; then
-    fuser -k ${PORT}/tcp 2>/dev/null || true
+    fuser -k "${p}/tcp" 2>/dev/null || true
   fi
 }
-kill_port 4000
-kill_port 5173
+free_port 4000
+free_port 5173
 
-# ── 5. Start server + client ────────────────────────────────────
+# ── 6. Start services ─────────────────────────────────────────────
 cleanup() {
-  echo -e "\n${Y}Stopping vault.msg…${NC}"
+  echo -e "\n${Y}Shutting down…${NC}"
   [ -n "${SERVER_PID:-}" ] && kill "$SERVER_PID" 2>/dev/null || true
   [ -n "${CLIENT_PID:-}" ] && kill "$CLIENT_PID" 2>/dev/null || true
   wait "${SERVER_PID:-}" 2>/dev/null || true
@@ -109,53 +102,56 @@ cleanup() {
 }
 trap cleanup SIGINT SIGTERM
 
-info "Starting server..."
-cd server
-(node index.js 2>&1 | while IFS= read -r line; do
-  echo -e "${BL}[server]${NC} $line"
-done) &
+info "Starting backend server..."
+(
+  cd "$SCRIPT_DIR/server"
+  node index.js 2>&1 | while IFS= read -r line; do
+    echo -e "${BL}[server]${NC} $line"
+  done
+) &
 SERVER_PID=$!
-cd ..
 
-# Wait for server health (up to 20s)
-echo -ne "  ${BL}Waiting for server${NC}"
-for i in $(seq 1 20); do
+# Wait for health check
+echo -ne "  ${BL}Waiting for server to be ready${NC}"
+READY=false
+for i in $(seq 1 30); do
   sleep 1
   if curl -sf http://localhost:4000/api/health >/dev/null 2>&1; then
-    echo -e "\r  ${G}✓ Server ready${NC}          "
+    READY=true
+    echo -e "\r  ${G}✓ Server ready${NC}                          "
     break
   fi
   echo -ne "."
-  if [ "$i" -eq 20 ]; then
-    echo ""
-    err "Server did not start. Check the [server] output above for errors."
-  fi
 done
+if [ "$READY" = "false" ]; then
+  echo ""
+  err "Server failed to start. Check the [server] output above."
+fi
 
 info "Starting frontend..."
-cd client
-(npm run dev 2>&1 | while IFS= read -r line; do
-  echo -e "${M}[client]${NC} $line"
-done) &
+(
+  cd "$SCRIPT_DIR/client"
+  npm run dev 2>&1 | while IFS= read -r line; do
+    echo -e "${M}[client]${NC} $line"
+  done
+) &
 CLIENT_PID=$!
-cd ..
 
 sleep 2
 
-# Try to open browser
-if command -v xdg-open &>/dev/null; then xdg-open http://localhost:5173 2>/dev/null & fi
-if command -v open      &>/dev/null; then open      http://localhost:5173 2>/dev/null & fi
-if command -v start     &>/dev/null; then start     http://localhost:5173 2>/dev/null & fi
+# Try to open browser (works on mac/linux — on Windows open manually)
+command -v xdg-open &>/dev/null && xdg-open "http://localhost:5173" 2>/dev/null &
+command -v open     &>/dev/null && open     "http://localhost:5173" 2>/dev/null &
 
 echo ""
 echo -e "${G}${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo -e "${G}${B}   vault.msg is running!${NC}"
 echo -e "${G}${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
-echo -e "  🌐  ${B}http://localhost:5173${NC}"
+echo -e "  🌐  Open in browser: ${B}http://localhost:5173${NC}"
 echo ""
 echo -e "  ${Y}Sign-up OTP codes appear in the [server] logs above.${NC}"
-echo -e "  ${Y}(Look for the ═══ box with your 6-digit code)${NC}"
+echo -e "  ${Y}Look for the ══ box with your 6-digit code.${NC}"
 echo ""
 echo -e "  Press ${B}Ctrl+C${NC} to stop."
 echo ""
