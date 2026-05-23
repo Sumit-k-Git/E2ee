@@ -1,102 +1,98 @@
 'use strict';
 
-/**
- * index.js — vault.msg server entry point
- *
- * Security layers applied (in order):
- * 1. Helmet — sets 14 security HTTP headers
- * 2. CORS — whitelist only your frontend origin
- * 3. Rate limiting — per-IP, per-route
- * 4. Body size limit — prevent payload bombs
- * 5. JWT auth — stateless, short-lived access tokens
- * 6. Input validation — on every route
- * 7. Parameterized SQL — all DB queries use prepared statements (no SQLi)
- * 8. WebSocket auth — token required within 10s
- * 9. Secure DB pragmas — WAL, foreign keys, secure_delete, synchronous FULL
- * 10. Audit log — security events recorded
- */
-
+// Load .env FIRST before anything else imports process.env
 require('dotenv').config();
 
-const http = require('http');
-const express = require('express');
-const helmet = require('helmet');
-const cors = require('cors');
+const http      = require('http');
+const express   = require('express');
+const helmet    = require('helmet');
+const cors      = require('cors');
 const rateLimit = require('express-rate-limit');
 const { getDb, tokens } = require('./database');
-const routes = require('./routes');
+const routes    = require('./routes');
 const { createWsServer } = require('./websocket');
 
-const PORT = parseInt(process.env.PORT) || 4000;
+const PORT           = parseInt(process.env.PORT) || 4000;
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || 'http://localhost:5173';
 
-// ── Initialize DB ─────────────────────────────────────────────────────────
-getDb(); // runs schema migrations on first start
-console.log('[db] SQLite initialized with WAL + secure_delete + foreign keys');
+// ── Validate required environment variables ───────────────────────────────
+const required = ['JWT_SECRET', 'JWT_REFRESH_SECRET'];
+const missing  = required.filter(k => !process.env[k]);
+if (missing.length) {
+  console.error(`\n[server] ERROR: Missing required environment variables: ${missing.join(', ')}`);
+  console.error('[server] Copy server/.env.example to server/.env and fill in the values.\n');
+  process.exit(1);
+}
+
+// ── Init DB (creates tables on first run) ─────────────────────────────────
+try {
+  getDb();
+  console.log('[db] SQLite ready');
+} catch (e) {
+  console.error('[db] Failed to initialize database:', e.message);
+  process.exit(1);
+}
 
 // ── Express app ───────────────────────────────────────────────────────────
 const app = express();
-
-// Trust first proxy (needed for accurate IP in rate limiting behind nginx)
 app.set('trust proxy', 1);
 
-// ── Security headers (Helmet) ─────────────────────────────────────────────
+// ── Security headers ──────────────────────────────────────────────────────
 app.use(helmet({
-  // Content-Security-Policy: only allow resources from same origin
   contentSecurityPolicy: {
     directives: {
-  defaultSrc: ["'self'"],
-  scriptSrc: ["'self'", "'unsafe-inline'"],
-  styleSrc: ["'self'", "'unsafe-inline'"],
-  imgSrc: ["'self'", 'data:', 'blob:'],
-  connectSrc: ["'self'", "http://localhost:4000", "ws://localhost:4000", "wss:"],
-  workerSrc: ["'self'", 'blob:'],
-  objectSrc: ["'none'"],
-  frameAncestors: ["'none'"],
-},
+      defaultSrc:     ["'self'"],
+      scriptSrc:      ["'self'", "'unsafe-inline'"],
+      styleSrc:       ["'self'", "'unsafe-inline'"],
+      imgSrc:         ["'self'", 'data:', 'blob:'],
+      connectSrc:     ["'self'", 'ws:', 'wss:'],
+      workerSrc:      ["'self'", 'blob:'],
+      objectSrc:      ["'none'"],
+      frameAncestors: ["'none'"],
+    },
   },
-  // Prevent browsers from caching responses containing tokens
-  referrerPolicy: {
-  policy: 'no-referrer',
-  },
-  // Prevent clickjacking
-  frameguard: { action: 'deny' },
-  // HSTS: force HTTPS for 1 year (uncomment in production with real TLS)
-  // hsts: { maxAge: 31536000, includeSubDomains: true, preload: true },
+  referrerPolicy: { policy: 'no-referrer' },
+  frameguard:     { action: 'deny' },
 }));
+
 app.use((req, res, next) => {
   res.setHeader('Cache-Control', 'no-store');
   next();
 });
-// ── CORS ──────────────────────────────────────────────────────────────────
+
+// ── CORS — supports multiple comma-separated origins ─────────────────────
+const allowedOrigins = ALLOWED_ORIGIN.split(',').map(o => o.trim()).filter(Boolean);
 app.use(cors({
-  origin: ALLOWED_ORIGIN,
-  credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  origin(origin, cb) {
+    // Allow no-origin requests (mobile apps, curl, same-origin)
+    if (!origin) return cb(null, true);
+    if (allowedOrigins.some(o => o === origin || o === '*')) return cb(null, true);
+    // Also allow any localhost origin in development
+    if (process.env.NODE_ENV !== 'production' && origin.startsWith('http://localhost')) {
+      return cb(null, true);
+    }
+    cb(new Error(`CORS: ${origin} not allowed`));
+  },
+  credentials:    true,
+  methods:        ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
-  exposedHeaders: ['X-RateLimit-Remaining'],
-}));
-app.use(cors({
-  origin: 'http://localhost:5173',
-  credentials: true
 }));
 
-
-// ── Body parsing with size limit ──────────────────────────────────────────
-// 64KB max — encrypted messages + metadata; no file uploads expected
+// ── Body parsing ──────────────────────────────────────────────────────────
 app.use(express.json({ limit: '64kb' }));
 app.use(express.urlencoded({ extended: false, limit: '64kb' }));
 
-// ── Global rate limiter ───────────────────────────────────────────────────
+// ── Rate limiting ─────────────────────────────────────────────────────────
 app.use(rateLimit({
-  windowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS) || 15 * 60 * 1000,
-  max: parseInt(process.env.RATE_LIMIT_MAX) || 100,
+  windowMs:        parseInt(process.env.RATE_LIMIT_WINDOW_MS) || 15 * 60 * 1000,
+  max:             parseInt(process.env.RATE_LIMIT_MAX) || 300,
   standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: 'Too many requests, slow down' },
+  legacyHeaders:   false,
+  message:         { error: 'Too many requests, please slow down' },
+  skip: (req) => req.path === '/api/health', // don't rate-limit health checks
 }));
 
-// ── Remove fingerprinting headers ─────────────────────────────────────────
+// Remove server fingerprinting
 app.use((req, res, next) => {
   res.removeHeader('X-Powered-By');
   res.removeHeader('Server');
@@ -106,46 +102,53 @@ app.use((req, res, next) => {
 // ── Routes ────────────────────────────────────────────────────────────────
 app.use('/api', routes);
 
-// 404 for unknown routes
-app.use((req, res) => {
-  res.status(404).json({ error: 'Not found' });
-});
+// 404 handler
+app.use((req, res) => res.status(404).json({ error: 'Not found' }));
 
-// Global error handler (never leak stack traces to client)
-app.use((err, req, res, next) => {
+// Global error handler — never leak stack traces
+app.use((err, req, res, _next) => {
   console.error('[error]', err.message);
+  if (err.message?.startsWith('CORS:')) {
+    return res.status(403).json({ error: err.message });
+  }
   res.status(500).json({ error: 'Internal server error' });
 });
 
-// ── HTTP server + WebSocket ───────────────────────────────────────────────
+// ── HTTP + WebSocket server ───────────────────────────────────────────────
 const server = http.createServer(app);
 createWsServer(server);
 
-server.listen(PORT, () => {
-  console.log(`[server] vault.msg listening on port ${PORT}`);
-  console.log(`[server] Allowed origin: ${ALLOWED_ORIGIN}`);
-  console.log(`[server] NODE_ENV: ${process.env.NODE_ENV}`);
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`[server] vault.msg running on port ${PORT}`);
+  console.log(`[server] NODE_ENV:        ${process.env.NODE_ENV || 'development'}`);
+  console.log(`[server] Allowed origins: ${ALLOWED_ORIGIN}`);
+  console.log(`[server] Email provider:  ${process.env.EMAIL_PROVIDER || 'dev'}`);
+  console.log(`[server] Health check:    http://localhost:${PORT}/api/health`);
 });
 
-// ── Periodic maintenance ──────────────────────────────────────────────────
-// Purge expired refresh tokens every hour
+// ── Maintenance ───────────────────────────────────────────────────────────
 setInterval(() => {
-  tokens.purgeExpired();
-  console.log('[maintenance] Purged expired refresh tokens');
+  try { tokens.purgeExpired(); } catch {}
 }, 60 * 60 * 1000);
 
-// Graceful shutdown
-process.on('SIGTERM', () => {
-  console.log('[server] SIGTERM received, closing...');
+// ── Graceful shutdown ─────────────────────────────────────────────────────
+function shutdown(signal) {
+  console.log(`\n[server] ${signal} received, shutting down gracefully...`);
   server.close(() => {
-    getDb().close();
+    try { getDb().close(); } catch {}
+    console.log('[server] Closed. Goodbye.');
     process.exit(0);
   });
-});
+  // Force exit after 10s if graceful shutdown hangs
+  setTimeout(() => process.exit(1), 10000);
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT',  () => shutdown('SIGINT'));
 
-process.on('SIGINT', () => {
-  server.close(() => {
-    getDb().close();
-    process.exit(0);
-  });
+process.on('uncaughtException', (err) => {
+  console.error('[server] Uncaught exception:', err);
+  shutdown('uncaughtException');
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('[server] Unhandled rejection:', reason);
 });

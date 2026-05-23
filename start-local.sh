@@ -1,257 +1,163 @@
 #!/usr/bin/env bash
-# ═══════════════════════════════════════════════════════════════
-#  vault.msg — start-local.sh
-#  Run the app locally with a single command. No Docker needed.
+# vault.msg — start-local.sh
+# Single command to run everything locally. No Docker needed.
+# Works on: macOS, Linux, Windows (Git Bash or WSL)
 #
-#  Usage:
-#    ./start-local.sh
-#
-#  What this does:
-#    ✓ Checks Node.js is installed (tells you how if not)
-#    ✓ Installs all dependencies automatically
-#    ✓ Creates .env with safe defaults if missing
-#    ✓ Generates JWT secrets automatically
-#    ✓ Starts backend + frontend together
-#    ✓ Opens the app in your browser
-#    ✓ OTP codes printed to terminal (no email setup needed)
-#    ✓ Ctrl+C stops everything cleanly
-# ═══════════════════════════════════════════════════════════════
+# Usage:  ./start-local.sh
 
 set -euo pipefail
-
-# ── Colors ────────────────────────────────────────────────────
-B='\033[1m'; R='\033[0;31m'; G='\033[0;32m'
-Y='\033[1;33m'; BL='\033[0;34m'; C='\033[0;36m'; NC='\033[0m'
-
-ok()   { echo -e "  ${G}✓${NC} $1"; }
-warn() { echo -e "  ${Y}⚠${NC}  $1"; }
-err()  { echo -e "\n${R}${B}ERROR:${NC} $1\n"; exit 1; }
-info() { echo -e "  ${C}→${NC} $1"; }
-step() { echo -e "\n${BL}${B}[$1]${NC} $2"; }
-
-# ── Find script's own directory (works from anywhere) ─────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# ── Banner ────────────────────────────────────────────────────
-echo ""
-echo -e "${BL}${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${BL}${B}   vault.msg — Local Startup${NC}"
-echo -e "${BL}${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo ""
+G='\033[0;32m'; Y='\033[1;33m'; BL='\033[0;34m'; R='\033[0;31m'; M='\033[0;35m'; B='\033[1m'; NC='\033[0m'
+ok()   { echo -e "  ${G}✓${NC} $1"; }
+warn() { echo -e "  ${Y}⚠${NC}  $1"; }
+err()  { echo -e "\n${R}${B}ERROR:${NC} $1\n"; exit 1; }
+info() { echo -e "  ${BL}→${NC} $1"; }
 
-# ──────────────────────────────────────────────────────────────
-# STEP 1 — Check Node.js
-# ──────────────────────────────────────────────────────────────
-step "1/4" "Checking Node.js..."
+echo -e "\n${BL}${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${BL}${B}   vault.msg — Starting locally${NC}"
+echo -e "${BL}${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}\n"
 
+# ── 1. Check Node.js ────────────────────────────────────────────
 if ! command -v node &>/dev/null; then
-  echo ""
-  echo -e "${Y}Node.js is not installed.${NC}"
-  echo ""
-  echo "  Install it in one of these ways:"
-  echo ""
-  echo -e "  ${B}Ubuntu / Debian:${NC}"
-  echo "    curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -"
-  echo "    sudo apt-get install -y nodejs"
-  echo ""
-  echo -e "  ${B}macOS:${NC}"
-  echo "    brew install node"
-  echo "    # or download from https://nodejs.org (click LTS)"
-  echo ""
-  echo -e "  ${B}Windows:${NC}"
-  echo "    Download from https://nodejs.org (click LTS)"
-  echo "    Then re-run this script in Git Bash or WSL"
-  echo ""
-  err "Please install Node.js 18+ and re-run ./start-local.sh"
+  echo -e "${Y}Node.js is not installed.${NC}\n"
+  echo "  Install it:"
+  echo "  • Ubuntu/Debian: curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash - && sudo apt-get install -y nodejs"
+  echo "  • macOS:         brew install node"
+  echo "  • Windows:       https://nodejs.org  (click LTS)"
+  err "Please install Node.js 18+ and re-run this script."
 fi
+VER=$(node -e "process.stdout.write(String(process.versions.node.split('.')[0]))")
+[ "$VER" -lt 18 ] && err "Node.js 18+ required. You have $(node --version). Download from https://nodejs.org"
+ok "Node.js $(node --version) detected"
 
-NODE_VER=$(node --version | grep -oP '\d+' | head -1)
-if [ "$NODE_VER" -lt 18 ]; then
-  err "Node.js $NODE_VER found but version 18+ is required. Download latest LTS from https://nodejs.org"
-fi
-
-ok "Node.js $(node --version) — npm $(npm --version)"
-
-# ──────────────────────────────────────────────────────────────
-# STEP 2 — Install dependencies
-# ──────────────────────────────────────────────────────────────
-step "2/4" "Installing dependencies..."
-
-# Server
-if [ ! -d "server/node_modules" ] || [ "server/package.json" -nt "server/node_modules/.package-lock.json" ]; then
-  info "Installing server packages..."
-  cd server && npm install --silent && cd ..
-  ok "Server dependencies installed"
+# ── 2. Install dependencies ─────────────────────────────────────
+if [ ! -d "server/node_modules" ]; then
+  info "Installing server packages (first time takes ~1 minute)..."
+  cd server && npm install && cd ..
+  ok "Server packages installed"
 else
-  ok "Server dependencies up to date"
+  ok "Server packages ready"
 fi
 
-# Client
-if [ ! -d "client/node_modules" ] || [ "client/package.json" -nt "client/node_modules/.package-lock.json" ]; then
+if [ ! -d "client/node_modules" ]; then
   info "Installing client packages..."
-  cd client && npm install --silent && cd ..
-  ok "Client dependencies installed"
+  cd client && npm install && cd ..
+  ok "Client packages installed"
 else
-  ok "Client dependencies up to date"
+  ok "Client packages ready"
 fi
 
-# ──────────────────────────────────────────────────────────────
-# STEP 3 — Configure .env
-# ──────────────────────────────────────────────────────────────
-step "3/4" "Setting up configuration..."
-
+# ── 3. Setup .env with auto-generated secrets ───────────────────
 if [ ! -f "server/.env" ]; then
-  info "Creating server/.env with local defaults..."
-  cat > server/.env << ENVEOF
-# vault.msg — local development config
-# Auto-generated by start-local.sh
-
-NODE_ENV=development
-PORT=4000
-ALLOWED_ORIGIN=http://localhost:5173
-
-# Secrets (auto-generated below — do not share these)
-JWT_SECRET=NEEDS_GENERATION
-JWT_REFRESH_SECRET=NEEDS_GENERATION
-OTP_SECRET=NEEDS_GENERATION
-
-# OTP: dev mode — codes printed to terminal, no email needed
-EMAIL_PROVIDER=dev
-
-# Database stored locally
-DB_PATH=./vault.db
-ENVEOF
-  ok "server/.env created"
+  cp server/.env.example server/.env
+fi
+if [ ! -f "client/.env" ]; then
+  cp client/.env.example client/.env
 fi
 
-# Auto-generate any missing secrets using Node.js crypto
-node << 'GENSCRIPT'
-const fs   = require('fs');
-const path = require('path');
+# Auto-generate any missing JWT secrets using Node.js crypto
+node - << 'GENSCRIPT'
+const fs     = require('fs');
+const path   = require('path');
 const crypto = require('crypto');
-
-const envPath = path.join(__dirname, 'server', '.env');
-let env = fs.readFileSync(envPath, 'utf8');
-let changed = false;
-
-const generate = () => crypto.randomBytes(64).toString('hex');
-
-if (env.includes('NEEDS_GENERATION') || env.match(/JWT_SECRET=\s*$/m)) {
-  env = env.replace(/JWT_SECRET=.*/,         `JWT_SECRET=${generate()}`);
-  env = env.replace(/JWT_REFRESH_SECRET=.*/, `JWT_REFRESH_SECRET=${generate()}`);
-  env = env.replace(/OTP_SECRET=.*/,         `OTP_SECRET=${generate()}`);
-  changed = true;
+const gen    = () => crypto.randomBytes(64).toString('hex');
+const file   = path.join(__dirname, 'server', '.env');
+let env      = fs.readFileSync(file, 'utf8');
+let changed  = false;
+for (const key of ['JWT_SECRET', 'JWT_REFRESH_SECRET', 'OTP_SECRET']) {
+  if (/^JWT_SECRET=\s*$|^JWT_REFRESH_SECRET=\s*$|^OTP_SECRET=\s*$/m.test(env) || env.match(new RegExp(`^${key}=\\s*$`, 'm'))) {
+    env = env.replace(new RegExp(`^${key}=.*$`, 'm'), `${key}=${gen()}`);
+    changed = true;
+  }
 }
-
 if (changed) {
-  fs.writeFileSync(envPath, env);
+  fs.writeFileSync(file, env);
   console.log('  \x1b[32m✓\x1b[0m JWT secrets generated');
+} else {
+  console.log('  \x1b[32m✓\x1b[0m Secrets already set');
 }
 GENSCRIPT
 
-ok "Configuration ready"
+# ── 4. Kill anything on our ports ──────────────────────────────
+kill_port() {
+  local PORT=$1
+  if command -v lsof &>/dev/null; then
+    local PIDS=$(lsof -ti:$PORT 2>/dev/null || true)
+    if [ -n "$PIDS" ]; then
+      warn "Port $PORT busy — freeing it..."
+      echo "$PIDS" | xargs kill -9 2>/dev/null || true
+      sleep 1
+    fi
+  elif command -v fuser &>/dev/null; then
+    fuser -k ${PORT}/tcp 2>/dev/null || true
+  fi
+}
+kill_port 4000
+kill_port 5173
 
-# Create client .env pointing to local backend
-if [ ! -f "client/.env" ]; then
-  cat > client/.env << CLIENTENV
-VITE_API_URL=http://localhost:4000/api
-VITE_WS_URL=ws://localhost:4000/ws
-CLIENTENV
-  ok "client/.env created"
-fi
-
-# ──────────────────────────────────────────────────────────────
-# STEP 4 — Start both services
-# ──────────────────────────────────────────────────────────────
-step "4/4" "Starting vault.msg..."
-
-# Clean up any leftover processes on our ports
+# ── 5. Start server + client ────────────────────────────────────
 cleanup() {
-  echo ""
-  echo -e "\n${Y}Shutting down…${NC}"
-  # Kill both background jobs
-  kill $SERVER_PID 2>/dev/null || true
-  kill $CLIENT_PID 2>/dev/null || true
-  wait $SERVER_PID 2>/dev/null || true
-  wait $CLIENT_PID 2>/dev/null || true
+  echo -e "\n${Y}Stopping vault.msg…${NC}"
+  [ -n "${SERVER_PID:-}" ] && kill "$SERVER_PID" 2>/dev/null || true
+  [ -n "${CLIENT_PID:-}" ] && kill "$CLIENT_PID" 2>/dev/null || true
+  wait "${SERVER_PID:-}" 2>/dev/null || true
+  wait "${CLIENT_PID:-}" 2>/dev/null || true
   echo -e "${G}Stopped. Goodbye!${NC}\n"
   exit 0
 }
 trap cleanup SIGINT SIGTERM
 
-# Free ports if something is already using them
-for PORT in 4000 5173; do
-  if lsof -ti:$PORT &>/dev/null 2>&1; then
-    warn "Port $PORT is in use — freeing it..."
-    lsof -ti:$PORT | xargs kill -9 2>/dev/null || true
-    sleep 1
-  fi
-done
-
-# ── Start server ──────────────────────────────────────────────
-info "Starting backend (port 4000)..."
-
-# Prefix every server log line with a colored tag
+info "Starting server..."
 cd server
-node index.js 2>&1 | while IFS= read -r line; do
+(node index.js 2>&1 | while IFS= read -r line; do
   echo -e "${BL}[server]${NC} $line"
-done &
+done) &
 SERVER_PID=$!
 cd ..
 
-# Wait for server to be ready (up to 15 seconds)
-SERVER_READY=false
-for i in $(seq 1 15); do
-  if curl -sf http://localhost:4000/api/health &>/dev/null; then
-    SERVER_READY=true
+# Wait for server health (up to 20s)
+echo -ne "  ${BL}Waiting for server${NC}"
+for i in $(seq 1 20); do
+  sleep 1
+  if curl -sf http://localhost:4000/api/health >/dev/null 2>&1; then
+    echo -e "\r  ${G}✓ Server ready${NC}          "
     break
   fi
-  sleep 1
+  echo -ne "."
+  if [ "$i" -eq 20 ]; then
+    echo ""
+    err "Server did not start. Check the [server] output above for errors."
+  fi
 done
 
-if [ "$SERVER_READY" = "false" ]; then
-  err "Server failed to start. Check the [server] logs above."
-fi
-ok "Backend running on http://localhost:4000"
-
-# ── Start client ──────────────────────────────────────────────
-info "Starting frontend (port 5173)..."
-
+info "Starting frontend..."
 cd client
-npm run dev 2>&1 | while IFS= read -r line; do
+(npm run dev 2>&1 | while IFS= read -r line; do
   echo -e "${M}[client]${NC} $line"
-done &
+done) &
 CLIENT_PID=$!
 cd ..
 
-# Wait for Vite to be ready
-sleep 3
+sleep 2
 
-# ── Open browser ──────────────────────────────────────────────
-APP_URL="http://localhost:5173"
+# Try to open browser
+if command -v xdg-open &>/dev/null; then xdg-open http://localhost:5173 2>/dev/null & fi
+if command -v open      &>/dev/null; then open      http://localhost:5173 2>/dev/null & fi
+if command -v start     &>/dev/null; then start     http://localhost:5173 2>/dev/null & fi
 
-if command -v xdg-open &>/dev/null; then
-  xdg-open "$APP_URL" 2>/dev/null &   # Linux
-elif command -v open &>/dev/null; then
-  open "$APP_URL" 2>/dev/null &        # macOS
-fi
-
-# ── Ready banner ──────────────────────────────────────────────
 echo ""
-echo -e "${G}${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${G}${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo -e "${G}${B}   vault.msg is running!${NC}"
-echo -e "${G}${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${G}${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
-echo -e "  🌐  Open in browser:  ${B}http://localhost:5173${NC}"
-echo -e "  🔒  Backend API:      ${B}http://localhost:4000/api/health${NC}"
+echo -e "  🌐  ${B}http://localhost:5173${NC}"
 echo ""
-echo -e "  ${Y}OTP codes appear here in the [server] logs above.${NC}"
-echo -e "  ${Y}(No email setup needed in dev mode)${NC}"
+echo -e "  ${Y}Sign-up OTP codes appear in the [server] logs above.${NC}"
+echo -e "  ${Y}(Look for the ═══ box with your 6-digit code)${NC}"
 echo ""
 echo -e "  Press ${B}Ctrl+C${NC} to stop."
 echo ""
 
-# ── Keep running ──────────────────────────────────────────────
-# Wait for either process to exit unexpectedly
-wait $SERVER_PID $CLIENT_PID
+wait "$SERVER_PID" "$CLIENT_PID"

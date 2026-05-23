@@ -1,0 +1,14 @@
+# Nixpacks config — used by Railway when not using Dockerfile
+# Tells Railway: build and run from the /server subfolder
+
+[phases.setup]
+nixPkgs = ["nodejs_20", "python3", "gcc", "gnumake"]
+
+[phases.install]
+cmds = ["cd server && npm install"]
+
+[phases.build]
+cmds = []
+
+[start]
+cmd = "cd server && node index.js"

@@ -1,29 +1,30 @@
 # Dependencies
 node_modules/
-**/node_modules/
 
-# Environment files — NEVER commit secrets
+# Build output
+client/dist/
+
+# Environment — NEVER commit real .env files
 .env
 server/.env
 client/.env
 *.env.local
-
-# Build output
-client/dist/
-client/dist-ssr/
+*.env.production
 
 # Database
 *.db
-*.db-wal
 *.db-shm
-backups/
+*.db-wal
+
+# TLS certificates
+certs/
+*.pem
+*.key
+*.crt
 
 # Logs
 *.log
 logs/
-
-# Backup files
-*.bak
 
 # OS
 .DS_Store
@@ -32,8 +33,14 @@ Thumbs.db
 # IDE
 .vscode/
 .idea/
-*.swp
 
-# Docker
-caddy_data/
-caddy_config/
+# Docker volumes
+data/
+
+# Backups
+*.bak
+
+# Keep .env.example files (they're templates, not secrets)
+!.env.example
+!server/.env.example
+!client/.env.example

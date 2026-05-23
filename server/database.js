@@ -1,29 +1,40 @@
 'use strict';
 
 /**
- * database.js — SQLite schema and query layer
- *
- * The server stores ZERO plaintext content.
- * Every message column is ciphertext + nonce produced by the client.
- * The server cannot decrypt anything here.
+ * database.js — SQLite via better-sqlite3
+ * Server stores ZERO plaintext. All message content is client-encrypted.
  */
 
 const Database = require('better-sqlite3');
-const path = require('path');
+const path     = require('path');
+const fs       = require('fs');
 require('dotenv').config();
 
-const DB_PATH = process.env.DB_PATH || './vault.db';
+function resolveDbPath() {
+  if (process.env.DB_PATH) return path.resolve(process.env.DB_PATH);
+  // Railway/Docker: use /data if writable, else /tmp
+  for (const dir of ['/data', '/tmp']) {
+    try {
+      fs.accessSync(dir, fs.constants.W_OK);
+      return path.join(dir, 'vault.db');
+    } catch {}
+  }
+  return path.resolve('./vault.db');
+}
 
 let db;
 
 function getDb() {
   if (db) return db;
-  db = new Database(path.resolve(DB_PATH));
 
+  const dbPath = resolveDbPath();
+  console.log(`[db] Using database at: ${dbPath}`);
+
+  db = new Database(dbPath);
   db.pragma('journal_mode = WAL');
   db.pragma('foreign_keys = ON');
   db.pragma('secure_delete = ON');
-  db.pragma('synchronous = FULL');
+  db.pragma('synchronous = NORMAL');
 
   db.exec(`
     CREATE TABLE IF NOT EXISTS users (
@@ -53,8 +64,8 @@ function getDb() {
       id            TEXT PRIMARY KEY,
       sender_id     TEXT NOT NULL REFERENCES users(id),
       recipient_id  TEXT NOT NULL REFERENCES users(id),
-      ciphertext    TEXT NOT NULL,
-      nonce         TEXT NOT NULL UNIQUE,
+      ciphertext    TEXT NOT NULL DEFAULT '',
+      nonce         TEXT NOT NULL DEFAULT '',
       ephemeral_pub TEXT NOT NULL DEFAULT '',
       client_ts     INTEGER NOT NULL DEFAULT 0,
       server_ts     INTEGER NOT NULL DEFAULT (unixepoch('now', 'subsec') * 1000),
@@ -63,9 +74,7 @@ function getDb() {
     );
     CREATE INDEX IF NOT EXISTS idx_msg_recipient ON messages(recipient_id, server_ts);
     CREATE INDEX IF NOT EXISTS idx_msg_sender    ON messages(sender_id, server_ts);
-    CREATE INDEX IF NOT EXISTS idx_msg_convo     ON messages(MIN(sender_id, recipient_id), MAX(sender_id, recipient_id), server_ts);
-    CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(sender_id, recipient_id, server_ts);
-    CREATE INDEX IF NOT EXISTS idx_messages_recipient_ts ON messages(recipient_id, server_ts);
+    CREATE INDEX IF NOT EXISTS idx_msg_pair      ON messages(sender_id, recipient_id, server_ts);
 
     CREATE TABLE IF NOT EXISTS prekeys (
       id          TEXT PRIMARY KEY,
@@ -96,134 +105,143 @@ function getDb() {
 const userQueries = {
   create(id, username, passwordHash, publicKey, keyFingerprint, email) {
     return getDb()
-      .prepare('INSERT INTO users (id, username, password_hash, public_key, key_fingerprint, email) VALUES (?, ?, ?, ?, ?, ?)')
+      .prepare('INSERT INTO users (id,username,password_hash,public_key,key_fingerprint,email) VALUES (?,?,?,?,?,?)')
       .run(id, username, passwordHash, publicKey, keyFingerprint, email || null);
   },
   findByUsername(username) {
     return getDb().prepare('SELECT * FROM users WHERE username = ?').get(username);
   },
   findById(id) {
-    return getDb().prepare('SELECT id, username, public_key, key_fingerprint, created_at, last_seen FROM users WHERE id = ?').get(id);
+    return getDb()
+      .prepare('SELECT id,username,public_key,key_fingerprint,created_at,last_seen FROM users WHERE id = ?')
+      .get(id);
   },
   searchByUsername(query, limit = 20) {
-    return getDb().prepare('SELECT id, username, public_key, key_fingerprint FROM users WHERE username LIKE ? LIMIT ?').all(`${query}%`, limit);
+    return getDb()
+      .prepare('SELECT id,username,public_key,key_fingerprint FROM users WHERE username LIKE ? LIMIT ?')
+      .all(`${query}%`, limit);
   },
   updateLastSeen(id) {
     return getDb().prepare('UPDATE users SET last_seen = unixepoch() WHERE id = ?').run(id);
   },
   updatePublicKey(id, publicKey, keyFingerprint) {
-    return getDb().prepare('UPDATE users SET public_key = ?, key_fingerprint = ? WHERE id = ?').run(publicKey, keyFingerprint, id);
+    return getDb()
+      .prepare('UPDATE users SET public_key = ?, key_fingerprint = ? WHERE id = ?')
+      .run(publicKey, keyFingerprint, id);
   },
 };
 
 const tokenQueries = {
   create(id, userId, tokenHash, expiresAt) {
-    return getDb().prepare('INSERT INTO refresh_tokens (id, user_id, token_hash, expires_at) VALUES (?, ?, ?, ?)').run(id, userId, tokenHash, expiresAt);
+    return getDb()
+      .prepare('INSERT INTO refresh_tokens (id,user_id,token_hash,expires_at) VALUES (?,?,?,?)')
+      .run(id, userId, tokenHash, expiresAt);
   },
   findByHash(tokenHash) {
-    return getDb().prepare('SELECT * FROM refresh_tokens WHERE token_hash = ? AND revoked = 0 AND expires_at > unixepoch()').get(tokenHash);
+    return getDb()
+      .prepare('SELECT * FROM refresh_tokens WHERE token_hash=? AND revoked=0 AND expires_at>unixepoch()')
+      .get(tokenHash);
   },
   revoke(id) {
-    return getDb().prepare('UPDATE refresh_tokens SET revoked = 1 WHERE id = ?').run(id);
+    return getDb().prepare('UPDATE refresh_tokens SET revoked=1 WHERE id=?').run(id);
   },
   revokeAllForUser(userId) {
-    return getDb().prepare('UPDATE refresh_tokens SET revoked = 1 WHERE user_id = ?').run(userId);
+    return getDb().prepare('UPDATE refresh_tokens SET revoked=1 WHERE user_id=?').run(userId);
   },
   purgeExpired() {
-    return getDb().prepare('DELETE FROM refresh_tokens WHERE expires_at <= unixepoch() OR revoked = 1').run();
+    return getDb().prepare('DELETE FROM refresh_tokens WHERE expires_at<=unixepoch() OR revoked=1').run();
   },
 };
 
 const messageQueries = {
-  // Used by WebSocket relay (with forward secrecy ephemeral key)
   insert(id, senderId, recipientId, ciphertext, nonce, ephemeralPub, clientTs) {
     return getDb()
-      .prepare('INSERT INTO messages (id, sender_id, recipient_id, ciphertext, nonce, ephemeral_pub, client_ts) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .prepare('INSERT INTO messages (id,sender_id,recipient_id,ciphertext,nonce,ephemeral_pub,client_ts) VALUES (?,?,?,?,?,?,?)')
       .run(id, senderId, recipientId, ciphertext, nonce, ephemeralPub, clientTs);
   },
-
-  // Used by REST POST /api/messages (added by Sumit — no ephemeral key for REST clients)
   create({ id, sender_id, recipient_id, ciphertext, nonce, created_at }) {
     return getDb()
-      .prepare('INSERT INTO messages (id, sender_id, recipient_id, ciphertext, nonce, ephemeral_pub, client_ts) VALUES (?, ?, ?, ?, ?, ?, ?)')
-      .run(id, sender_id, recipient_id, ciphertext, nonce, '', created_at);
+      .prepare("INSERT INTO messages (id,sender_id,recipient_id,ciphertext,nonce,ephemeral_pub,client_ts) VALUES (?,?,?,?,?,'',?)")
+      .run(id, sender_id, recipient_id, ciphertext, nonce, created_at);
   },
-
   getConversation(userA, userB, limit = 50, beforeTs = null) {
-    const base = `
-      SELECT id, sender_id, recipient_id, ciphertext, nonce, ephemeral_pub, client_ts, server_ts, read_at
-      FROM messages
-      WHERE deleted_at IS NULL
-        AND ((sender_id = ? AND recipient_id = ?) OR (sender_id = ? AND recipient_id = ?))
-        ${beforeTs ? 'AND server_ts < ?' : ''}
-      ORDER BY server_ts DESC LIMIT ?`;
-    const params = beforeTs ? [userA, userB, userB, userA, beforeTs, limit] : [userA, userB, userB, userA, limit];
-    return getDb().prepare(base).all(...params).reverse();
+    const sql = `
+      SELECT id,sender_id,recipient_id,ciphertext,nonce,ephemeral_pub,client_ts,server_ts,read_at
+      FROM   messages
+      WHERE  deleted_at IS NULL
+        AND  ((sender_id=? AND recipient_id=?) OR (sender_id=? AND recipient_id=?))
+        ${beforeTs ? 'AND server_ts<?' : ''}
+      ORDER  BY server_ts DESC LIMIT ?`;
+    const p = beforeTs ? [userA,userB,userB,userA,beforeTs,limit] : [userA,userB,userB,userA,limit];
+    return getDb().prepare(sql).all(...p).reverse();
   },
-
   getUndelivered(recipientId, sinceTs) {
     return getDb()
-      .prepare('SELECT id, sender_id, ciphertext, nonce, ephemeral_pub, client_ts, server_ts FROM messages WHERE recipient_id = ? AND server_ts > ? AND deleted_at IS NULL ORDER BY server_ts ASC')
+      .prepare('SELECT id,sender_id,ciphertext,nonce,ephemeral_pub,client_ts,server_ts FROM messages WHERE recipient_id=? AND server_ts>? AND deleted_at IS NULL ORDER BY server_ts ASC')
       .all(recipientId, sinceTs);
   },
-
   markRead(messageId, recipientId) {
     return getDb()
-      .prepare('UPDATE messages SET read_at = unixepoch() WHERE id = ? AND recipient_id = ? AND read_at IS NULL')
+      .prepare('UPDATE messages SET read_at=unixepoch() WHERE id=? AND recipient_id=? AND read_at IS NULL')
       .run(messageId, recipientId);
   },
-
   softDelete(messageId, requesterId) {
     return getDb()
-      .prepare("UPDATE messages SET deleted_at = unixepoch(), ciphertext = '', nonce = '', ephemeral_pub = '' WHERE id = ? AND (sender_id = ? OR recipient_id = ?)")
+      .prepare("UPDATE messages SET deleted_at=unixepoch(),ciphertext='deleted',nonce='del_'||id,ephemeral_pub='' WHERE id=? AND (sender_id=? OR recipient_id=?)")
       .run(messageId, requesterId, requesterId);
   },
-
   getConversationList(userId) {
     return getDb().prepare(`
       SELECT
-        m.id, m.sender_id, m.recipient_id, m.ciphertext, m.nonce,
-        m.ephemeral_pub, m.server_ts,
+        lm.id, lm.sender_id, lm.recipient_id, lm.ciphertext, lm.nonce,
+        lm.ephemeral_pub, lm.server_ts,
         u.username        AS contact_username,
         u.public_key      AS contact_public_key,
         u.key_fingerprint AS contact_fingerprint,
-        SUM(CASE WHEN m.recipient_id = ? AND m.read_at IS NULL AND m.deleted_at IS NULL THEN 1 ELSE 0 END) AS unread_count
-      FROM messages m
-      JOIN users u ON u.id = CASE WHEN m.sender_id = ? THEN m.recipient_id ELSE m.sender_id END
-      WHERE (m.sender_id = ? OR m.recipient_id = ?)
-        AND m.deleted_at IS NULL
-        AND m.id IN (
-          SELECT id FROM messages m2
-          WHERE ((m2.sender_id = ? AND m2.recipient_id = u.id) OR (m2.recipient_id = ? AND m2.sender_id = u.id))
-          AND m2.deleted_at IS NULL
-          ORDER BY m2.server_ts DESC LIMIT 1
-        )
-      GROUP BY u.id
-      ORDER BY m.server_ts DESC
-    `).all(userId, userId, userId, userId, userId, userId);
+        COALESCE(uc.unread_count, 0) AS unread_count
+      FROM (
+        SELECT
+          CASE WHEN sender_id=? THEN recipient_id ELSE sender_id END AS contact_id,
+          MAX(server_ts) AS max_ts
+        FROM messages
+        WHERE (sender_id=? OR recipient_id=?) AND deleted_at IS NULL
+        GROUP BY contact_id
+      ) AS conv
+      JOIN messages lm
+        ON  lm.server_ts = conv.max_ts
+        AND ((lm.sender_id=? AND lm.recipient_id=conv.contact_id) OR (lm.recipient_id=? AND lm.sender_id=conv.contact_id))
+        AND lm.deleted_at IS NULL
+      JOIN users u ON u.id = conv.contact_id
+      LEFT JOIN (
+        SELECT sender_id, COUNT(*) AS unread_count
+        FROM messages WHERE recipient_id=? AND read_at IS NULL AND deleted_at IS NULL
+        GROUP BY sender_id
+      ) AS uc ON uc.sender_id = conv.contact_id
+      ORDER BY lm.server_ts DESC
+    `).all(userId,userId,userId,userId,userId,userId);
   },
 };
 
 const prekeyQueries = {
   store(id, userId, prekeyPub, signature) {
-    return getDb().prepare('INSERT INTO prekeys (id, user_id, prekey_pub, signature) VALUES (?, ?, ?, ?)').run(id, userId, prekeyPub, signature);
+    return getDb().prepare('INSERT INTO prekeys (id,user_id,prekey_pub,signature) VALUES (?,?,?,?)').run(id,userId,prekeyPub,signature);
   },
   fetchOne(userId) {
-    const row = getDb().prepare('SELECT * FROM prekeys WHERE user_id = ? AND used = 0 ORDER BY created_at ASC LIMIT 1').get(userId);
-    if (row) getDb().prepare('UPDATE prekeys SET used = 1 WHERE id = ?').run(row.id);
+    const row = getDb().prepare('SELECT * FROM prekeys WHERE user_id=? AND used=0 ORDER BY created_at ASC LIMIT 1').get(userId);
+    if (row) getDb().prepare('UPDATE prekeys SET used=1 WHERE id=?').run(row.id);
     return row;
   },
   countAvailable(userId) {
-    return getDb().prepare('SELECT COUNT(*) as count FROM prekeys WHERE user_id = ? AND used = 0').get(userId);
+    return getDb().prepare('SELECT COUNT(*) AS count FROM prekeys WHERE user_id=? AND used=0').get(userId);
   },
 };
 
 const auditQueries = {
   log(event, userId, ip, userAgent, metadata = {}) {
     return getDb()
-      .prepare('INSERT INTO audit_log (event, user_id, ip, user_agent, metadata) VALUES (?, ?, ?, ?, ?)')
-      .run(event, userId || null, ip || null, userAgent || null, JSON.stringify(metadata));
+      .prepare('INSERT INTO audit_log (event,user_id,ip,user_agent,metadata) VALUES (?,?,?,?,?)')
+      .run(event, userId||null, ip||null, userAgent||null, JSON.stringify(metadata));
   },
 };
 
-module.exports = { getDb, users: userQueries, tokens: tokenQueries, messages: messageQueries, prekeys: prekeyQueries, audit: auditQueries };
+module.exports = { getDb, users:userQueries, tokens:tokenQueries, messages:messageQueries, prekeys:prekeyQueries, audit:auditQueries };
