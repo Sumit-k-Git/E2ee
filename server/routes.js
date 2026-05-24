@@ -49,8 +49,14 @@ function validateEmail(e) {
 // FIX: proper base64 regex that correctly handles +, /, and = padding
 function validateBase64(s, maxLen = 200) {
   if (typeof s !== 'string' || s.length === 0 || s.length > maxLen) return false;
-  // Standard base64: groups of 4 chars from [A-Za-z0-9+/] with optional = padding
-  return /^[A-Za-z0-9+/]*={0,2}$/.test(s);
+  // Accept standard (+/) and URL-safe (-_) base64, with optional padding
+  return /^[A-Za-z0-9+/\-_]*={0,2}$/.test(s.trim());
+}
+
+// Normalize URL-safe base64 to standard base64 for consistent storage
+function normalizeBase64(s) {
+  if (!s || typeof s !== 'string') return s;
+  return s.trim().replace(/-/g, '+').replace(/_/g, '/');
 }
 
 // ── OTP ───────────────────────────────────────────────────────────────────
@@ -99,10 +105,12 @@ router.post('/auth/register', authLimiter, async (req, res) => {
     return res.status(403).json({ error: 'Email not verified. Please complete OTP verification first.' });
   if (users.findByUsername(username))
     return res.status(409).json({ error: 'Username already taken' });
+  if (users.findByEmail(email))
+    return res.status(409).json({ error: 'An account with this email already exists. Please sign in instead.' });
 
   const id           = uuidv4();
   const passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
-  users.create(id, username, passwordHash, public_key, key_fingerprint, email.trim().toLowerCase());
+  users.create(id, username, passwordHash, normalizeBase64(public_key), key_fingerprint, email.trim().toLowerCase());
   audit.log('register', id, ip, req.headers['user-agent']);
 
   const { token: accessToken } = signAccessToken(id, username);
@@ -188,7 +196,7 @@ router.put('/users/key', requireAuth, (req, res) => {
     return res.status(400).json({ error: 'Invalid public key' });
   if (typeof key_fingerprint !== 'string' || key_fingerprint.length !== 64)
     return res.status(400).json({ error: 'Invalid key fingerprint' });
-  users.updatePublicKey(req.user.id, public_key, key_fingerprint);
+  users.updatePublicKey(req.user.id, normalizeBase64(public_key), key_fingerprint);
   audit.log('key_rotation', req.user.id, getClientIp(req), req.headers['user-agent']);
   return res.json({ ok: true });
 });

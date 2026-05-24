@@ -43,7 +43,7 @@ function getDb() {
       password_hash   TEXT NOT NULL,
       public_key      TEXT NOT NULL,
       key_fingerprint TEXT NOT NULL,
-      email           TEXT,
+      email           TEXT UNIQUE,
       created_at      INTEGER NOT NULL DEFAULT (unixepoch()),
       last_seen       INTEGER
     );
@@ -110,6 +110,9 @@ const userQueries = {
   },
   findByUsername(username) {
     return getDb().prepare('SELECT * FROM users WHERE username = ?').get(username);
+  },
+  findByEmail(email) {
+    return getDb().prepare('SELECT id, username FROM users WHERE email = ?').get(email ? email.toLowerCase().trim() : null);
   },
   findById(id) {
     return getDb()
