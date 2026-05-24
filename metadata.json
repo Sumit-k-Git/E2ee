@@ -1,0 +1,6 @@
+{
+  "name": "E2EE Messenger",
+  "description": "Zero-knowledge End-to-End Encrypted Live Messenger using Node, WebSockets, and secure verified OTP delivery",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

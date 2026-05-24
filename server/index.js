@@ -12,16 +12,15 @@ const { getDb, tokens } = require('./database');
 const routes    = require('./routes');
 const { createWsServer } = require('./websocket');
 
-const PORT           = parseInt(process.env.PORT) || 4000;
-const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || 'http://localhost:5173';
+const PORT           = parseInt(process.env.PORT) || 3000;
+const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
 
-// ── Validate required environment variables ───────────────────────────────
-const required = ['JWT_SECRET', 'JWT_REFRESH_SECRET'];
-const missing  = required.filter(k => !process.env[k]);
-if (missing.length) {
-  console.error(`\n[server] ERROR: Missing required environment variables: ${missing.join(', ')}`);
-  console.error('[server] Copy server/.env.example to server/.env and fill in the values.\n');
-  process.exit(1);
+// ── Auto-generate secrets if missing for seamless workspace execution ───
+if (!process.env.JWT_SECRET) {
+  process.env.JWT_SECRET = require('crypto').randomBytes(32).toString('hex');
+}
+if (!process.env.JWT_REFRESH_SECRET) {
+  process.env.JWT_REFRESH_SECRET = require('crypto').randomBytes(32).toString('hex');
 }
 
 // ── Init DB (creates tables on first run) ─────────────────────────────────
@@ -102,17 +101,44 @@ app.use((req, res, next) => {
 // ── Routes ────────────────────────────────────────────────────────────────
 app.use('/api', routes);
 
-// 404 handler
-app.use((req, res) => res.status(404).json({ error: 'Not found' }));
+// Vite Client / Middleware & Static Asset Servicing
+if (process.env.NODE_ENV !== "production") {
+  const { createServer: createViteServer } = require("vite");
+  createViteServer({
+    server: { middlewareMode: true },
+    appType: "spa",
+  }).then((vite) => {
+    app.use(vite.middlewares);
+    
+    // Global error handler
+    app.use((err, req, res, _next) => {
+      console.error('[error]', err.message);
+      if (err.message?.startsWith('CORS:')) {
+        return res.status(403).json({ error: err.message });
+      }
+      res.status(500).json({ error: 'Internal server error' });
+    });
+  });
+} else {
+  const path = require("path");
+  const distPath = path.join(__dirname, "../dist");
+  app.use(express.static(distPath));
+  app.get("*", (req, res) => {
+    res.sendFile(path.join(distPath, "index.html"));
+  });
+  
+  // 404 handler
+  app.use((req, res) => res.status(404).json({ error: 'Not found' }));
 
-// Global error handler — never leak stack traces
-app.use((err, req, res, _next) => {
-  console.error('[error]', err.message);
-  if (err.message?.startsWith('CORS:')) {
-    return res.status(403).json({ error: err.message });
-  }
-  res.status(500).json({ error: 'Internal server error' });
-});
+  // Global error handler
+  app.use((err, req, res, _next) => {
+    console.error('[error]', err.message);
+    if (err.message?.startsWith('CORS:')) {
+      return res.status(403).json({ error: err.message });
+    }
+    res.status(500).json({ error: 'Internal server error' });
+  });
+}
 
 // ── HTTP + WebSocket server ───────────────────────────────────────────────
 const server = http.createServer(app);
