@@ -2,13 +2,6 @@
 
 /**
  * otp.js — Email OTP for sign-up verification
- *
- * Supported providers (set EMAIL_PROVIDER in Railway env):
- *   dev      → code shown on website UI (default, no email setup)
- *   gmail    → Gmail with App Password
- *   brevo    → Brevo SMTP (free, 300/day, recommended for production)
- *   outlook  → Outlook/Hotmail
- *   smtp     → Any custom SMTP server
  */
 
 const crypto = require('crypto');
@@ -22,7 +15,6 @@ function getOtpSecret() {
   return process.env.OTP_SECRET || process.env.JWT_SECRET || 'fallback-change-in-prod';
 }
 
-// email → { codeHash, expiresAt, attempts, sentCount, windowStart }
 const store = new Map();
 
 function hashCode(code) {
@@ -33,7 +25,6 @@ function generateOTP() {
   return String(crypto.randomBytes(4).readUInt32BE(0) % 1000000).padStart(6, '0');
 }
 
-// ── Build nodemailer transport from env vars ───────────────────────────────
 function buildTransport(nodemailer) {
   const provider = (process.env.EMAIL_PROVIDER || 'dev').toLowerCase();
 
@@ -48,19 +39,22 @@ function buildTransport(nodemailer) {
   }
 
   if (provider === 'brevo') {
-    // Brevo (formerly Sendinblue) — free tier: 300 emails/day
-    // Get SMTP key from: https://app.brevo.com/settings/keys/smtp
     if (!process.env.BREVO_SMTP_KEY) {
-      throw new Error('Brevo requires BREVO_SMTP_KEY in environment variables. Get it from https://app.brevo.com/settings/keys/smtp');
+      throw new Error('Brevo requires BREVO_SMTP_KEY in environment variables.');
     }
+    const brevoPort = parseInt(process.env.BREVO_PORT || '587');
+    const brevoSecure = process.env.BREVO_SECURE === 'true' || brevoPort === 465;
     return nodemailer.createTransport({
-      host:   'smtp-relay.brevo.com',
-      port:   587,
-      secure: false,
+      host:   process.env.BREVO_HOST || 'smtp-relay.brevo.com',
+      port:   brevoPort,
+      secure: brevoSecure,
       auth: {
         user: process.env.EMAIL_USER || process.env.BREVO_LOGIN,
         pass: process.env.BREVO_SMTP_KEY,
       },
+      tls: {
+        rejectUnauthorized: false
+      }
     });
   }
 
@@ -92,13 +86,11 @@ function buildTransport(nodemailer) {
   throw new Error(`Unknown EMAIL_PROVIDER "${provider}". Use: dev, gmail, brevo, outlook, or smtp`);
 }
 
-// ── Send OTP ──────────────────────────────────────────────────────────────
 async function sendOTP(email) {
   const key = email.toLowerCase().trim();
   const now = Date.now();
   const provider = (process.env.EMAIL_PROVIDER || 'dev').toLowerCase();
 
-  // Rate limit: 3 sends per 15 min per email
   const existing = store.get(key);
   if (existing) {
     const age = now - (existing.windowStart || 0);
@@ -118,47 +110,52 @@ async function sendOTP(email) {
     windowStart: existing?.windowStart && sentCount > 1 ? existing.windowStart : now,
   });
 
-  // ── DEV MODE — no email, show code in UI ──────────────────────────────
   if (provider === 'dev') {
     console.log('\n' + '═'.repeat(48));
-    console.log('  vault.msg OTP  [DEV MODE — no email sent]');
-    console.log('─'.repeat(48));
+    console.log('  vault.msg OTP  [DEV MODE]');
     console.log(`  Email : ${key}`);
-    console.log(`  Code  : ${code}   ← shown on website`);
+    console.log(`  Code  : ${code}`);
     console.log('═'.repeat(48) + '\n');
-    // Return the code so UI can display it
     return { sent: true, isTest: true, code };
   }
 
-  // ── PRODUCTION EMAIL ──────────────────────────────────────────────────
   let nodemailer;
   try {
     nodemailer = require('nodemailer');
   } catch {
-    throw new Error('nodemailer package missing. Run: cd server && npm install');
+    throw new Error('nodemailer package missing.');
   }
 
   let transport;
   try {
     transport = buildTransport(nodemailer);
   } catch (e) {
-    // Config error — log clearly and fall back to dev mode so signup doesn't break
     console.error('\n[otp] EMAIL CONFIG ERROR:', e.message);
-    console.error('[otp] Falling back to dev mode — code shown on website');
-    console.error('[otp] Fix your email environment variables in Railway to send real emails\n');
-    console.log(`[otp] DEV FALLBACK — Code for ${key}: ${code}`);
     return { sent: true, isTest: true, code };
   }
 
-  // Send the email
+  // Auto-resolve validated from address matching Brevo authenticated user
+  let fromAddress;
+  const loginUser = process.env.EMAIL_USER || process.env.BREVO_LOGIN || '';
+  if (process.env.EMAIL_FROM) {
+    if (process.env.EMAIL_FROM.includes('<')) {
+      fromAddress = process.env.EMAIL_FROM;
+    } else {
+      fromAddress = `"vault.msg" <${process.env.EMAIL_FROM}>`;
+    }
+  } else if (loginUser) {
+    fromAddress = `"vault.msg" <${loginUser}>`;
+  } else {
+    fromAddress = '"vault.msg" <noreply@vault.msg>';
+  }
+
   try {
     await transport.sendMail({
-      from:    `"vault.msg" <${process.env.EMAIL_FROM || process.env.EMAIL_USER || 'noreply@vault.msg'}>`,
+      from:    fromAddress,
       to:      key,
       subject: `${code} — Your vault.msg verification code`,
       html: `<!DOCTYPE html>
 <html>
-<head><meta charset="utf-8"></head>
 <body style="margin:0;padding:0;background:#0c0d11;font-family:Arial,sans-serif;">
   <table width="100%" cellpadding="0" cellspacing="0" style="background:#0c0d11;padding:40px 20px;">
     <tr><td align="center">
@@ -181,19 +178,16 @@ async function sendOTP(email) {
   </table>
 </body>
 </html>`,
-      text: `Your vault.msg sign-up code: ${code}\n\nExpires in 10 minutes.\nIf you didn't request this, ignore this email.`,
+      text: `Your vault.msg sign-up code: ${code}\n\nExpires in 10 minutes.`,
     });
     console.log(`[otp] Email sent to ${key} via ${provider}`);
     return { sent: true, isTest: false };
   } catch (e) {
     console.error(`[otp] Failed to send email to ${key}:`, e.message);
-    // Don't expose email errors to the client — just say it was sent
-    // The code is still valid so the user can try entering it from Railway logs
-    throw new Error('Failed to send verification email. Please check your email address and try again.');
+    throw new Error('Failed to send verification email. Please check configuration.');
   }
 }
 
-// ── Verify OTP ────────────────────────────────────────────────────────────
 function verifyOTP(email, code) {
   const key    = email.toLowerCase().trim();
   const record = store.get(key);
