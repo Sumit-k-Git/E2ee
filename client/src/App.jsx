@@ -590,6 +590,17 @@ export default function App() {
   function handleWsMessage(msg) {
     if (msg.type === 'ws_status') { setWsStatus(msg.status); return; }
 
+    // FIX: handle server-sent error frames (MISSING_FIELDS, RECIPIENT_NOT_FOUND, etc.)
+    // Previously these were silently dropped, leaving sendMessage to time out after 15s.
+    if (msg.type === 'error') {
+      const errorText = msg.code
+        ? `Send failed: ${msg.code.toLowerCase().replace(/_/g, ' ')}`
+        : 'Send failed — unknown error';
+      setSendError(errorText);
+      setTimeout(() => setSendError(''), 5000);
+      return;
+    }
+
     if (msg.type === 'new_message') {
       const cId = msg.sender_id;
       const kp  = myKeysRef.current;
@@ -646,6 +657,12 @@ export default function App() {
     if (!input.trim() || !activeId || !myKeys || sending) return;
     const contact = contacts[activeId];
     if (!contact?.public_key) return;
+    // FIX: check WS is connected before encrypting and sending
+    if (!socketRef.current?.connected) {
+      setSendError('Not connected — waiting for connection to be established');
+      setTimeout(() => setSendError(''), 4000);
+      return;
+    }
     const text = input.trim();
     setInput('');
     setSending(true);

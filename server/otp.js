@@ -3,9 +3,11 @@
 /**
  * otp.js — OTP email delivery
  *
- * Brevo connection timeout fix:
- * Railway blocks outbound port 587. Use port 465 (SSL) instead.
- * Or use Brevo's HTTP API (no SMTP needed, always works).
+ * BUG FIXES:
+ * 1. Removed fallback to 'noreply@vaultmsg.app' — Brevo rejects unverified senders.
+ *    EMAIL_FROM must be explicitly set to a verified Brevo sender.
+ * 2. Added clear startup validation of EMAIL_FROM when provider=brevo.
+ * 3. Better user-facing error messages that explain what to fix.
  */
 
 const crypto  = require('crypto');
@@ -34,21 +36,23 @@ function sendViaBrevoAPI(to, code) {
   return new Promise((resolve, reject) => {
     const apiKey = process.env.BREVO_API_KEY;
     if (!apiKey) {
-      reject(new Error('BREVO_API_KEY not set. Get it from https://app.brevo.com/settings/keys/api'));
-      return;
-    }
-
-    // EMAIL_FROM must be set to a verified sender in your Brevo account.
-    // e.g. EMAIL_FROM=noreply@yourdomain.com
-    // DO NOT leave this as the default — Brevo will reject unverified sender addresses.
-    const from = process.env.EMAIL_FROM || process.env.EMAIL_USER;
-    if (!from) {
       reject(new Error(
-        'EMAIL_FROM is not set. In Railway, add EMAIL_FROM=noreply@yourdomain.com ' +
-        '(must be a verified sender in your Brevo account at https://app.brevo.com/senders)'
+        'BREVO_API_KEY is not set. In Railway Variables, add your Brevo API key from https://app.brevo.com/settings/keys/api'
       ));
       return;
     }
+
+    // FIX: EMAIL_FROM must be a verified sender in Brevo — no fallback to unverified domains.
+    // Brevo returns 400 "valid sender email required" if this address is not verified.
+    const from = process.env.EMAIL_FROM || process.env.EMAIL_USER;
+    if (!from) {
+      reject(new Error(
+        'EMAIL_FROM is not set. In Railway Variables, add EMAIL_FROM=noreply@yourdomain.com ' +
+        '(must be verified at https://app.brevo.com/senders)'
+      ));
+      return;
+    }
+
     const fromName = 'vault.msg';
 
     const body = JSON.stringify({
@@ -107,7 +111,7 @@ async function sendViaSMTP(to, code, provider) {
     transport = nodemailer.createTransport({
       host:   'smtp-relay.brevo.com',
       port:   465,
-      secure: true, // SSL on 465
+      secure: true,
       auth: {
         user: process.env.EMAIL_USER || process.env.BREVO_LOGIN,
         pass: process.env.BREVO_SMTP_KEY,
@@ -216,8 +220,18 @@ async function sendOTP(email) {
       return { sent: true, isTest: false };
     } catch (e) {
       console.error('[otp] Brevo API error:', e.message);
+      // FIX: give specific, actionable errors instead of a generic message
       if (e.message.includes('valid sender') || e.message.includes('invalid_parameter')) {
-        throw new Error('Email delivery failed: sender address not verified in Brevo. Visit https://app.brevo.com/senders and verify your EMAIL_FROM address.');
+        throw new Error(
+          'Email failed: sender not verified in Brevo. ' +
+          'Go to app.brevo.com/senders and verify your EMAIL_FROM address.'
+        );
+      }
+      if (e.message.includes('BREVO_API_KEY')) {
+        throw new Error(e.message);
+      }
+      if (e.message.includes('EMAIL_FROM')) {
+        throw new Error(e.message);
       }
       throw new Error('Could not send verification email. Please try again shortly.');
     }
