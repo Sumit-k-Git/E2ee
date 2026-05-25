@@ -3,15 +3,6 @@
 /**
  * routes.js — REST API
  * Server never sees plaintext. All message content is client-encrypted ciphertext.
- *
- * BUG FIXES:
- * 1. validateBase64: tweetnacl encodeBase64 produces standard base64 with padding.
- *    The old regex was ambiguous with the '-' in the character class. Fixed to be explicit.
- * 2. /messages POST: ephemeral_pub validation used maxLen=64 but base64(32 bytes)=44 chars.
- *    relaxed to 64 to handle any padding variations — already fine, but also fixed the
- *    route to return 500 properly on DB errors instead of silently failing.
- * 3. send-otp error: was returning 429 for ALL errors including config errors. Now 500
- *    for server config issues, 429 only for rate limit, 400 for bad input.
  */
 
 const express   = require('express');
@@ -55,12 +46,11 @@ function validatePassword(p) {
 function validateEmail(e) {
   return typeof e === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e.trim()) && e.length <= 254;
 }
-
-// FIX: tweetnacl encodeBase64 produces standard base64 (+, /, =).
-// Accept both standard and URL-safe variants with correct padding.
+// FIX: proper base64 regex that correctly handles +, /, and = padding
 function validateBase64(s, maxLen = 200) {
   if (typeof s !== 'string' || s.length === 0 || s.length > maxLen) return false;
-  return /^[A-Za-z0-9+/\-_]+=*$/.test(s.trim());
+  // Accept standard (+/) and URL-safe (-_) base64, with optional padding
+  return /^[A-Za-z0-9+/\-_]*={0,2}$/.test(s.trim());
 }
 
 // Normalize URL-safe base64 to standard base64 for consistent storage
@@ -78,14 +68,7 @@ router.post('/auth/send-otp', otpLimiter, async (req, res) => {
     const result = await sendOTP(email.trim().toLowerCase());
     return res.json({ sent: true, dev: result.isTest, dev_code: result.code || undefined });
   } catch (e) {
-    // FIX: distinguish rate-limit errors from server config errors
-    const msg = e.message || '';
-    if (msg.includes('Too many')) return res.status(429).json({ error: msg });
-    if (msg.includes('not set') || msg.includes('not verified') || msg.includes('verified in Brevo')) {
-      console.error('[routes] OTP config error:', msg);
-      return res.status(500).json({ error: 'Email service is not configured. Please contact support.' });
-    }
-    return res.status(500).json({ error: msg });
+    return res.status(429).json({ error: e.message });
   }
 });
 
@@ -171,7 +154,6 @@ router.post('/auth/login', authLimiter, async (req, res) => {
   });
 });
 
-// FIX: /auth/refresh — return new tokens properly, and handle user-not-found
 router.post('/auth/refresh', async (req, res) => {
   const { refresh_token } = req.body;
   if (!refresh_token) return res.status(400).json({ error: 'Refresh token required' });
@@ -234,8 +216,6 @@ router.post('/messages', requireAuth, (req, res) => {
   if (!recipient_id) return res.status(400).json({ error: 'recipient_id required' });
   if (!validateBase64(ciphertext, 16384)) return res.status(400).json({ error: 'Invalid ciphertext' });
   if (!validateBase64(nonce, 64)) return res.status(400).json({ error: 'Invalid nonce' });
-  // FIX: ephemeral_pub is 32 bytes = 44 base64 chars. Allow up to 64 for padding variations.
-  if (ephemeral_pub && !validateBase64(ephemeral_pub, 64)) return res.status(400).json({ error: 'Invalid ephemeral_pub' });
   const recipient = users.findById(recipient_id);
   if (!recipient) return res.status(404).json({ error: 'Recipient not found' });
   if (recipient_id === req.user.id) return res.status(400).json({ error: 'Cannot message yourself' });

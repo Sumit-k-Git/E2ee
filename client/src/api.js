@@ -1,23 +1,10 @@
 /**
  * api.js — HTTP + WebSocket client for vault.msg
  *
- * BUG FIXES:
- * 1. SESSION EXPIRED on reload: silentRefresh was the only restore path.
- *    If sessionStorage is cleared (tab closed, private mode) the refresh token
- *    is gone and auth.restore() returns false, showing the login screen even
- *    though the user just refreshed the page. This is correct behavior — but
- *    the old code was also firing 'auth:expired' event on any 401 during restore,
- *    which triggered a logout flash even before the user did anything.
- *    FIX: don't fire auth:expired during the initial restore attempt — only after
- *    a real authenticated request fails mid-session.
- *
- * 2. "unexpected type" on messages: the WS _handleMessage didn't forward
- *    server 'error' frames to the app — they were silently dropped, leaving
- *    the sendMessage promise to timeout after 15s with a confusing timeout error.
- *    FIX: forward error frames so App can show the real error immediately.
- *
- * 3. sendMessage when WS not connected: promise silently sat forever.
- *    FIX: reject immediately if WS is not OPEN when sendMessage is called.
+ * Security:
+ * - Access tokens in memory only (never localStorage)
+ * - Refresh tokens in sessionStorage (cleared on tab close)
+ * - Auto silent refresh on 401
  */
 
 const BASE   = import.meta.env.VITE_API_URL || 'http://localhost:4000/api';
@@ -25,9 +12,6 @@ const WS_URL = import.meta.env.VITE_WS_URL  || 'ws://localhost:4000/ws';
 
 // ── Token storage ─────────────────────────────────────────────────────────
 let _accessToken = null;
-// FIX: track whether we are in the initial restore phase
-let _isRestoring = false;
-
 const setAccessToken  = (t) => { _accessToken = t; };
 const getAccessToken  = ()  => _accessToken;
 const setRefreshToken = (t) => t ? sessionStorage.setItem('rt', t) : sessionStorage.removeItem('rt');
@@ -49,11 +33,7 @@ async function apiFetch(path, options = {}, retry = true) {
     const refreshed = await silentRefresh();
     if (refreshed) return apiFetch(path, options, false);
     clearTokens();
-    // FIX: only fire auth:expired if we are NOT in the restore phase.
-    // During restore, a 401 just means "not logged in" — not an expired session.
-    if (!_isRestoring) {
-      window.dispatchEvent(new Event('auth:expired'));
-    }
+    window.dispatchEvent(new Event('auth:expired'));
     throw new Error('Session expired — please sign in again');
   }
 
@@ -121,16 +101,7 @@ export const auth = {
     try { await apiFetch('/auth/logout', { method: 'POST' }); } finally { clearTokens(); }
   },
 
-  // FIX: wrap restore in _isRestoring flag so 401s during restore don't
-  // trigger the auth:expired event and force an unnecessary sign-out.
-  async restore() {
-    _isRestoring = true;
-    try {
-      return await silentRefresh();
-    } finally {
-      _isRestoring = false;
-    }
-  },
+  restore: () => silentRefresh(),
 };
 
 // ── Users API ─────────────────────────────────────────────────────────────
@@ -194,15 +165,7 @@ export class VaultSocket {
     this.ws.onclose = (e) => {
       this.connected = false;
       clearInterval(this._heartbeat);
-      // FIX: if server closes with 4001 (invalid token), try refreshing then reconnect
-      if (!this._destroyed && e.code === 4001) {
-        silentRefresh().then(ok => {
-          if (ok && !this._destroyed) this.connect();
-          else window.dispatchEvent(new Event('auth:expired'));
-        });
-        return;
-      }
-      if (!this._destroyed) {
+      if (!this._destroyed && e.code !== 4001) {
         setTimeout(() => this.connect(), this.reconnectDelay);
         this.reconnectDelay = Math.min(this.reconnectDelay * 2, this.maxDelay);
       }
@@ -223,22 +186,6 @@ export class VaultSocket {
       if (p) { clearTimeout(p.timer); p.resolve(msg); this.pendingAcks.delete(msg.ref); }
       return;
     }
-    // FIX: handle server error frames — reject the matching pending promise
-    // instead of silently dropping the error or letting it time out.
-    if (msg.type === 'error') {
-      if (msg.ref) {
-        const p = this.pendingAcks.get(msg.ref);
-        if (p) {
-          clearTimeout(p.timer);
-          p.reject(new Error(msg.code || 'Server error'));
-          this.pendingAcks.delete(msg.ref);
-          return;
-        }
-      }
-      // Unref'd error — forward to app so it can show it
-      this.onMessage(msg);
-      return;
-    }
     if (msg.server_ts) {
       this.lastTs = Math.max(this.lastTs, msg.server_ts);
       localStorage.setItem('last_ws_ts', String(this.lastTs));
@@ -251,10 +198,6 @@ export class VaultSocket {
   }
 
   sendMessage(recipientId, ciphertext, nonce, ephemeralPub, clientTs) {
-    // FIX: reject immediately if not connected — don't wait 15s to timeout
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      return Promise.reject(new Error('Not connected — please wait for the connection to be established'));
-    }
     const ref = Math.random().toString(36).slice(2);
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
