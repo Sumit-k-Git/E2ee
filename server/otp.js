@@ -1,18 +1,16 @@
 'use strict';
 
 /**
- * otp.js — Email OTP for sign-up verification
+ * otp.js — OTP email delivery
  *
- * Supported providers (set EMAIL_PROVIDER in Railway env):
- *   dev      → code shown on website UI (default, no email setup)
- *   gmail    → Gmail with App Password
- *   brevo    → Brevo SMTP (free, 300/day, recommended for production)
- *   outlook  → Outlook/Hotmail
- *   smtp     → Any custom SMTP server
+ * Brevo connection timeout fix:
+ * Railway blocks outbound port 587. Use port 465 (SSL) instead.
+ * Or use Brevo's HTTP API (no SMTP needed, always works).
  */
 
-const crypto = require('crypto');
-const jwt    = require('jsonwebtoken');
+const crypto  = require('crypto');
+const jwt     = require('jsonwebtoken');
+const https   = require('https');
 require('dotenv').config();
 
 const OTP_EXPIRY_MS    = 10 * 60 * 1000;
@@ -22,71 +20,100 @@ function getOtpSecret() {
   return process.env.OTP_SECRET || process.env.JWT_SECRET || 'fallback-change-in-prod';
 }
 
-// email → { codeHash, expiresAt, attempts, sentCount, windowStart }
-const store = new Map();
+const store = new Map(); // email → { codeHash, expiresAt, attempts, sentCount, windowStart }
 
 function hashCode(code) {
   return crypto.createHash('sha256').update(String(code).trim()).digest('hex');
 }
-
 function generateOTP() {
   return String(crypto.randomBytes(4).readUInt32BE(0) % 1000000).padStart(6, '0');
 }
 
-// ── Build nodemailer transport from env vars ───────────────────────────────
-function buildTransport(nodemailer) {
-  const provider = (process.env.EMAIL_PROVIDER || 'dev').toLowerCase();
+// ── Brevo HTTP API (no SMTP — works on Railway) ───────────────────────────
+function sendViaBrevoAPI(to, code) {
+  return new Promise((resolve, reject) => {
+    const apiKey = process.env.BREVO_API_KEY;
+    if (!apiKey) {
+      reject(new Error('BREVO_API_KEY not set. Get it from https://app.brevo.com/settings/keys/api'));
+      return;
+    }
+
+    const from  = process.env.EMAIL_FROM || process.env.EMAIL_USER || 'noreply@vaultmsg.app';
+    const fromName = 'vault.msg';
+
+    const body = JSON.stringify({
+      sender:  { name: fromName, email: from },
+      to:      [{ email: to }],
+      subject: `${code} — Your vault.msg verification code`,
+      htmlContent: buildEmailHtml(code),
+      textContent: `Your vault.msg verification code: ${code}\n\nExpires in 10 minutes.`,
+    });
+
+    const options = {
+      hostname: 'api.brevo.com',
+      path:     '/v3/smtp/email',
+      method:   'POST',
+      headers: {
+        'Content-Type':  'application/json',
+        'api-key':       apiKey,
+        'Content-Length': Buffer.byteLength(body),
+      },
+    };
+
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          resolve({ ok: true });
+        } else {
+          reject(new Error(`Brevo API error ${res.statusCode}: ${data}`));
+        }
+      });
+    });
+
+    req.on('error', reject);
+    req.setTimeout(10000, () => { req.destroy(); reject(new Error('Brevo API request timed out')); });
+    req.write(body);
+    req.end();
+  });
+}
+
+// ── Gmail / SMTP via nodemailer ────────────────────────────────────────────
+async function sendViaSMTP(to, code, provider) {
+  let nodemailer;
+  try { nodemailer = require('nodemailer'); }
+  catch { throw new Error('nodemailer not installed. Run: npm install in server/'); }
+
+  let transport;
 
   if (provider === 'gmail') {
-    if (!process.env.EMAIL_USER || !process.env.EMAIL_PASS) {
-      throw new Error('Gmail requires EMAIL_USER and EMAIL_PASS (App Password) in environment variables.');
-    }
-    return nodemailer.createTransport({
+    transport = nodemailer.createTransport({
       service: 'gmail',
       auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS },
     });
-  }
-
-  if (provider === 'brevo') {
-    // Brevo (formerly Sendinblue) — free tier: 300 emails/day
-    // Get SMTP key from: https://app.brevo.com/settings/keys/smtp
-    if (!process.env.BREVO_SMTP_KEY) {
-      throw new Error('Brevo requires BREVO_SMTP_KEY in environment variables. Get it from https://app.brevo.com/settings/keys/smtp');
-    }
-    const brevoPort = parseInt(process.env.BREVO_PORT || '587');
-    const brevoSecure = process.env.BREVO_SECURE === 'true' || brevoPort === 465;
-    return nodemailer.createTransport({
-      host:   process.env.BREVO_HOST || 'smtp-relay.brevo.com',
-      port:   brevoPort,
-      secure: brevoSecure,
+  } else if (provider === 'brevo_smtp') {
+    // Brevo SMTP — use port 465 (SSL) since Railway blocks 587
+    transport = nodemailer.createTransport({
+      host:   'smtp-relay.brevo.com',
+      port:   465,
+      secure: true, // SSL on 465
       auth: {
         user: process.env.EMAIL_USER || process.env.BREVO_LOGIN,
         pass: process.env.BREVO_SMTP_KEY,
       },
-      tls: {
-        rejectUnauthorized: false
-      }
     });
-  }
-
-  if (provider === 'outlook') {
-    if (!process.env.EMAIL_USER || !process.env.EMAIL_PASS) {
-      throw new Error('Outlook requires EMAIL_USER and EMAIL_PASS in environment variables.');
-    }
-    return nodemailer.createTransport({
+  } else if (provider === 'outlook') {
+    transport = nodemailer.createTransport({
       service: 'hotmail',
       auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS },
     });
-  }
-
-  if (provider === 'smtp') {
-    if (!process.env.SMTP_HOST) {
-      throw new Error('SMTP provider requires SMTP_HOST in environment variables.');
-    }
-    return nodemailer.createTransport({
+  } else {
+    // Generic SMTP
+    transport = nodemailer.createTransport({
       host:   process.env.SMTP_HOST,
-      port:   parseInt(process.env.SMTP_PORT || '587'),
-      secure: process.env.SMTP_SECURE === 'true',
+      port:   parseInt(process.env.SMTP_PORT || '465'),
+      secure: process.env.SMTP_SECURE !== 'false',
       auth: {
         user: process.env.SMTP_USER || process.env.EMAIL_USER,
         pass: process.env.SMTP_PASS || process.env.EMAIL_PASS,
@@ -94,13 +121,50 @@ function buildTransport(nodemailer) {
     });
   }
 
-  throw new Error(`Unknown EMAIL_PROVIDER "${provider}". Use: dev, gmail, brevo, outlook, or smtp`);
+  await transport.sendMail({
+    from:    `"vault.msg" <${process.env.EMAIL_FROM || process.env.EMAIL_USER}>`,
+    to,
+    subject: `${code} — Your vault.msg verification code`,
+    html:    buildEmailHtml(code),
+    text:    `Your vault.msg verification code: ${code}\n\nExpires in 10 minutes.`,
+  });
 }
 
-// ── Send OTP ──────────────────────────────────────────────────────────────
+// ── Email HTML template ────────────────────────────────────────────────────
+function buildEmailHtml(code) {
+  return `<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#0c0d11;font-family:Arial,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#0c0d11;padding:40px 20px;">
+    <tr><td align="center">
+      <table width="400" cellpadding="0" cellspacing="0"
+        style="background:#13141a;border:1px solid #272833;border-radius:16px;padding:32px;max-width:400px;width:100%;">
+        <tr><td>
+          <p style="font-family:monospace;font-size:22px;color:#6c63ff;margin:0 0 6px;">vault.msg</p>
+          <p style="font-size:12px;color:#5a5d73;margin:0 0 24px;">Zero-knowledge encrypted messenger</p>
+          <p style="font-size:15px;color:#e4e5f0;margin:0 0 16px;">Your sign-up verification code:</p>
+          <div style="background:#1a1b23;border:2px solid #272833;border-radius:12px;
+            padding:24px;text-align:center;margin:0 0 20px;">
+            <span style="font-family:monospace;font-size:42px;font-weight:bold;
+              letter-spacing:16px;color:#4fd1c5;">${code}</span>
+          </div>
+          <p style="font-size:12px;color:#5a5d73;line-height:1.8;margin:0;">
+            Expires in <strong style="color:#e4e5f0;">10 minutes</strong>.<br>
+            If you didn't request this, ignore this email.
+          </p>
+        </td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>`;
+}
+
+// ── Main sendOTP ───────────────────────────────────────────────────────────
 async function sendOTP(email) {
-  const key = email.toLowerCase().trim();
-  const now = Date.now();
+  const key      = email.toLowerCase().trim();
+  const now      = Date.now();
   const provider = (process.env.EMAIL_PROVIDER || 'dev').toLowerCase();
 
   // Rate limit: 3 sends per 15 min per email
@@ -123,93 +187,37 @@ async function sendOTP(email) {
     windowStart: existing?.windowStart && sentCount > 1 ? existing.windowStart : now,
   });
 
-  // ── DEV MODE — no email, show code in UI ──────────────────────────────
+  // ── DEV MODE ─────────────────────────────────────────────────────────────
   if (provider === 'dev') {
-    console.log('\n' + '═'.repeat(48));
-    console.log('  vault.msg OTP  [DEV MODE — no email sent]');
-    console.log('─'.repeat(48));
+    console.log('\n' + '═'.repeat(50));
+    console.log('  vault.msg  │  OTP CODE [DEV MODE]');
+    console.log('─'.repeat(50));
     console.log(`  Email : ${key}`);
     console.log(`  Code  : ${code}   ← shown on website`);
-    console.log('═'.repeat(48) + '\n');
-    // Return the code so UI can display it
+    console.log('═'.repeat(50) + '\n');
     return { sent: true, isTest: true, code };
   }
 
-  // ── PRODUCTION EMAIL ──────────────────────────────────────────────────
-  let nodemailer;
-  try {
-    nodemailer = require('nodemailer');
-  } catch {
-    throw new Error('nodemailer package missing. Run: cd server && npm install');
-  }
-
-  let transport;
-  try {
-    transport = buildTransport(nodemailer);
-  } catch (e) {
-    // Config error — log clearly and fall back to dev mode so signup doesn't break
-    console.error('\n[otp] EMAIL CONFIG ERROR:', e.message);
-    console.error('[otp] Falling back to dev mode — code shown on website');
-    console.error('[otp] Fix your email environment variables in Railway to send real emails\n');
-    console.log(`[otp] DEV FALLBACK — Code for ${key}: ${code}`);
-    return { sent: true, isTest: true, code };
-  }
-
-  // Resolve from address cleanly to support plain emails, custom display names, and verified Brevo credentials
-  let fromAddress;
-  const loginUser = process.env.EMAIL_USER || process.env.BREVO_LOGIN || '';
-  if (process.env.EMAIL_FROM) {
-    if (process.env.EMAIL_FROM.includes('<')) {
-      fromAddress = process.env.EMAIL_FROM;
-    } else {
-      fromAddress = `"vault.msg" <${process.env.EMAIL_FROM}>`;
+  // ── BREVO HTTP API (recommended — works on Railway) ───────────────────────
+  if (provider === 'brevo') {
+    try {
+      await sendViaBrevoAPI(key, code);
+      console.log(`[otp] Email sent to ${key} via Brevo API`);
+      return { sent: true, isTest: false };
+    } catch (e) {
+      console.error('[otp] Brevo API error:', e.message);
+      throw new Error('Could not send verification email via Brevo. Check BREVO_API_KEY in Railway.');
     }
-  } else if (loginUser) {
-    fromAddress = `"vault.msg" <${loginUser}>`;
-  } else {
-    fromAddress = '"vault.msg" <noreply@vault.msg>';
   }
 
-  // Send the email
+  // ── GMAIL / SMTP ──────────────────────────────────────────────────────────
   try {
-    await transport.sendMail({
-      from:    fromAddress,
-      to:      key,
-      subject: `${code} — Your vault.msg verification code`,
-      html: `<!DOCTYPE html>
-<html>
-<head><meta charset="utf-8"></head>
-<body style="margin:0;padding:0;background:#0c0d11;font-family:Arial,sans-serif;">
-  <table width="100%" cellpadding="0" cellspacing="0" style="background:#0c0d11;padding:40px 20px;">
-    <tr><td align="center">
-      <table width="400" cellpadding="0" cellspacing="0" style="background:#13141a;border:1px solid #272833;border-radius:16px;padding:32px;">
-        <tr><td>
-          <p style="font-family:monospace;font-size:22px;color:#6c63ff;margin:0 0 8px;">vault.msg</p>
-          <p style="font-size:13px;color:#5a5d73;margin:0 0 24px;">Zero-knowledge encrypted messenger</p>
-          <p style="font-size:15px;color:#e4e5f0;margin:0 0 16px;">Your sign-up verification code:</p>
-          <div style="background:#1a1b23;border:2px solid #272833;border-radius:12px;padding:24px;text-align:center;margin:0 0 20px;">
-            <span style="font-family:monospace;font-size:42px;font-weight:bold;letter-spacing:16px;color:#4fd1c5;">${code}</span>
-          </div>
-          <p style="font-size:12px;color:#5a5d73;line-height:1.8;margin:0;">
-            This code expires in <strong style="color:#e4e5f0;">10 minutes</strong>.<br>
-            Enter it on vault.msg to complete your sign-up.<br>
-            If you didn't request this, you can ignore this email.
-          </p>
-        </td></tr>
-      </table>
-    </td></tr>
-  </table>
-</body>
-</html>`,
-      text: `Your vault.msg sign-up code: ${code}\n\nExpires in 10 minutes.\nIf you didn't request this, ignore this email.`,
-    });
+    await sendViaSMTP(key, code, provider);
     console.log(`[otp] Email sent to ${key} via ${provider}`);
     return { sent: true, isTest: false };
   } catch (e) {
-    console.error(`[otp] Failed to send email to ${key}:`, e.message);
-    // Don't expose email errors to the client — just say it was sent
-    // The code is still valid so the user can try entering it from Railway logs
-    throw new Error('Failed to send verification email. Please check your email address and try again.');
+    console.error(`[otp] ${provider} send failed:`, e.message);
+    throw new Error(`Failed to send verification email (${e.message}). Check email settings in Railway.`);
   }
 }
 
@@ -218,8 +226,7 @@ function verifyOTP(email, code) {
   const key    = email.toLowerCase().trim();
   const record = store.get(key);
 
-  if (!record)
-    throw new Error('No code found for this email. Please request a new one.');
+  if (!record) throw new Error('No code found for this email. Please request a new one.');
   if (Date.now() > record.expiresAt) {
     store.delete(key);
     throw new Error('Code has expired. Please request a new one.');
@@ -229,12 +236,11 @@ function verifyOTP(email, code) {
     throw new Error('Too many incorrect attempts. Please request a new code.');
   }
 
-  const inputHash = hashCode(code);
   let match = false;
   try {
     match = crypto.timingSafeEqual(
-      Buffer.from(inputHash,       'hex'),
-      Buffer.from(record.codeHash, 'hex')
+      Buffer.from(hashCode(code), 'hex'),
+      Buffer.from(record.codeHash,  'hex')
     );
   } catch { match = false; }
 

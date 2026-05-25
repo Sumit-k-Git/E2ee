@@ -1,0 +1,46 @@
+# Dependencies
+node_modules/
+
+# Build output
+client/dist/
+
+# Environment — NEVER commit real .env files
+.env
+server/.env
+client/.env
+*.env.local
+*.env.production
+
+# Database
+*.db
+*.db-shm
+*.db-wal
+
+# TLS certificates
+certs/
+*.pem
+*.key
+*.crt
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Docker volumes
+data/
+
+# Backups
+*.bak
+
+# Keep .env.example files (they're templates, not secrets)
+!.env.example
+!server/.env.example
+!client/.env.example
