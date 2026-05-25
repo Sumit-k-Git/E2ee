@@ -38,7 +38,17 @@ function sendViaBrevoAPI(to, code) {
       return;
     }
 
-    const from  = process.env.EMAIL_FROM || process.env.EMAIL_USER || 'noreply@vaultmsg.app';
+    // EMAIL_FROM must be set to a verified sender in your Brevo account.
+    // e.g. EMAIL_FROM=noreply@yourdomain.com
+    // DO NOT leave this as the default — Brevo will reject unverified sender addresses.
+    const from = process.env.EMAIL_FROM || process.env.EMAIL_USER;
+    if (!from) {
+      reject(new Error(
+        'EMAIL_FROM is not set. In Railway, add EMAIL_FROM=noreply@yourdomain.com ' +
+        '(must be a verified sender in your Brevo account at https://app.brevo.com/senders)'
+      ));
+      return;
+    }
     const fromName = 'vault.msg';
 
     const body = JSON.stringify({
@@ -206,7 +216,10 @@ async function sendOTP(email) {
       return { sent: true, isTest: false };
     } catch (e) {
       console.error('[otp] Brevo API error:', e.message);
-      throw new Error('Could not send verification email via Brevo. Check BREVO_API_KEY in Railway.');
+      if (e.message.includes('valid sender') || e.message.includes('invalid_parameter')) {
+        throw new Error('Email delivery failed: sender address not verified in Brevo. Visit https://app.brevo.com/senders and verify your EMAIL_FROM address.');
+      }
+      throw new Error('Could not send verification email. Please try again shortly.');
     }
   }
 
